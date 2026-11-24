@@ -1,0 +1,139 @@
+diff --git a/common/languages/en.xml b/common/languages/en.xml
+index 9d1c0e9..15f46ce 100644
+--- a/common/languages/en.xml
++++ b/common/languages/en.xml
+@@ -4,6 +4,8 @@
+ 	<display>English</display>
+ 
+ 	<resources>
++		<string name="ext4_resize_full">Filesystem already at usable limit; no resize needed.</string>
++		<string name="ext4_maintenance_blocked">Ext4 maintenance: {1}</string>
+ 		<!-- Font overrides - only change these if your language requires special characters -->
+ 
+ 		<!-- Partition display names -->
+diff --git a/extra-languages/languages/zh_CH.xml b/extra-languages/languages/zh_CH.xml
+index b7d6070..5054337 100644
+--- a/extra-languages/languages/zh_CH.xml
++++ b/extra-languages/languages/zh_CH.xml
+@@ -3,6 +3,8 @@
+ 	<display>Chinese Simplified</display>
+ 
+ 	<resources>
++		<string name="ext4_resize_full">文件系统已达到可用上限，无需调整大小。</string>
++		<string name="ext4_maintenance_blocked">Ext4 维护：{1}</string>
+ 		<!-- Font overrides - only change these if your language requires special characters -->
+ 		<resource name="status" type="fontoverride" filename="DroidSansFallback.ttf" scale="100"/>
+ 		<resource name="bigfont" type="fontoverride" filename="DroidSansFallback.ttf" scale="100"/>
+diff --git a/portrait_hdpi/pages/settings.xml b/portrait_hdpi/pages/settings.xml
+index 6c7e175..627b030 100644
+--- a/portrait_hdpi/pages/settings.xml
++++ b/portrait_hdpi/pages/settings.xml
+@@ -62,6 +62,12 @@
+ 					<action function="page">ext_time</action>
+ 				</listitem>
+ 				<listitem name="{@about_hdr}">
++					<condition var1="fox_local_build" op="!"/>
++					<icon res="bs_btn_set_about"/>
++					<action function="page">about</action>
++				</listitem>
++				<listitem name="{@about_hdr} (%fox_display_version%)">
++					<condition var1="fox_local_build"/>
+ 					<icon res="bs_btn_set_about"/>
+ 					<action function="page">about</action>
+ 				</listitem>
+@@ -150,6 +156,7 @@
+ 			<listbox style="settingslist">
+ 				<placement x="0" y="%row1_2_y%" w="%screen_w%" h="%lb_l5%"/>
+ 				<listitem name="{@mount_sys_ro_chk}">
++					<condition var1="fox_compatibility_fox_device" op="!=" var2="judyln"/>
+ 					<condition var1="general_back" var2="mount"/>
+ 					<condition var1="tw_mount_system_ro" op="!=" var2="0"/>
+ 					<icon res="checkbox_true"/>
+@@ -157,6 +164,7 @@
+ 					<action function="page">system_readonly_check</action>
+ 				</listitem>
+ 				<listitem name="{@mount_sys_ro_chk}">
++					<condition var1="fox_compatibility_fox_device" op="!=" var2="judyln"/>
+ 					<condition var1="general_back" var2="mount"/>
+ 					<condition var1="tw_mount_system_ro" var2="0"/>
+ 					<icon res="checkbox_false"/>
+@@ -224,12 +232,14 @@
+ 			<listbox style="settingslist">
+ 				<placement x="0" y="%row2_2_y%" w="%screen_w%" h="%lb_l10%"/>
+ 				<listitem name="{@mount_sys_ro_chk}">
++					<condition var1="fox_compatibility_fox_device" op="!=" var2="judyln"/>
+ 					<icon res="checkbox_true"/>
+ 					<condition var1="tw_mount_system_ro" op="!=" var2="0"/>
+ 					<action function="set">tw_lifetime_writes=2</action>
+ 					<action function="page">system_readonly_check</action>
+ 				</listitem>
+ 				<listitem name="{@mount_sys_ro_chk}">
++					<condition var1="fox_compatibility_fox_device" op="!=" var2="judyln"/>
+ 					<condition var1="tw_mount_system_ro" var2="0"/>
+ 					<icon res="checkbox_false"/>
+ 					<action function="mountsystemtoggle">1</action>
+@@ -996,12 +1006,28 @@
+ 			</text>
+ 			
+ 			<text>
++				<condition var1="fox_local_build" op="!"/>
+ 				<font resource="orangefont" color="#ffffff"/>
+ 				<placement x="%about_txt_x%" y="%about_txt2_y%"/>
+ 				<text>{@version}: %fox_actual_build%</text>
+ 			</text>
+ 
+ 			<text>
++				<condition var1="fox_local_build" op="!"/>
++				<font resource="orangefont" color="#ffffff"/>
++				<placement x="%about_txt_x%" y="%about_txt3_y%"/>
++				<text>{@build_type}: %fox_build_type1%</text>
++			</text>
++
++			<text>
++				<condition var1="fox_local_build"/>
++				<font resource="orangefont" color="#ffffff"/>
++				<placement x="%about_txt_x%" y="%about_txt2_y%"/>
++				<text>{@version}: %fox_display_version% (%fox_local_build%)</text>
++			</text>
++
++			<text>
++				<condition var1="fox_local_build"/>
+ 				<font resource="orangefont" color="#ffffff"/>
+ 				<placement x="%about_txt_x%" y="%about_txt3_y%"/>
+ 				<text>{@build_type}: %fox_build_type1%</text>
+diff --git a/portrait_hdpi/pages/wipe.xml b/portrait_hdpi/pages/wipe.xml
+index 377717b..622e006 100644
+--- a/portrait_hdpi/pages/wipe.xml
++++ b/portrait_hdpi/pages/wipe.xml
+@@ -453,7 +453,7 @@
+ 					<text>{@resize_btn}</text>
+ 					<action function="set">tw_back=partitionoptions</action>
+ 					<action function="set">tw_action=resize</action>
+-					<action function="set">tw_action_param=%tw_partition_mount_point%</action>
++					<action function="set">tw_action_param=%tw_partition_maintenance_arg%</action>
+ 					<action function="set">tw_has_action2=1</action>
+ 					<action function="set">tw_action2=getpartitiondetails</action>
+ 					<action function="set">tw_text1={@resize_confirm}</action>
+@@ -479,7 +479,7 @@
+ 					<text>{@repair_btn}</text>
+ 					<action function="set">tw_back=partitionoptions</action>
+ 					<action function="set">tw_action=repair</action>
+-					<action function="set">tw_action_param=%tw_partition_mount_point%</action>
++					<action function="set">tw_action_param=%tw_partition_maintenance_arg%</action>
+ 					<action function="set">tw_has_action2=0</action>
+ 					<action function="set">tw_text1={@repair_confirm}</action>
+ 					<action function="set">tw_text2=%tw_partition_name%</action>
+@@ -490,9 +490,10 @@
+ 					<action function="page">wipe_confirm_action</action>
+ 				</button>
+ 
+-				<button style="btn_raised_hl">
+-					<placement x="%btn_raised_right_x%" y="%row_btn1_y%" placement="1"/>
+-					<text>{@change_fs_btn}</text>
++					<button style="btn_raised_hl">
++						<condition var1="tw_partition_can_format" var2="1"/>
++						<placement x="%btn_raised_right_x%" y="%row_btn1_y%" placement="1"/>
++						<text>{@change_fs_btn}</text>
+ 					<action function="page">selectfilesystem</action>
+ 				</button>
+ 

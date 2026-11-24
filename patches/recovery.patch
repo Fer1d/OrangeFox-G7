@@ -1,0 +1,2921 @@
+diff --git a/Android.mk b/Android.mk
+index 64c58aa..87135ee 100755
+--- a/Android.mk
++++ b/Android.mk
+@@ -102,6 +102,12 @@ endif
+ 
+ LOCAL_MODULE := recovery
+ 
++ifeq ($(TARGET_DEVICE),judyln)
++    # The pinned legacy updater imports the old libsparse C ABI.
++    LOCAL_SRC_FILES += judy_sparse_crc32.cpp
++    LOCAL_LDFLAGS += -Wl,--export-dynamic-symbol=sparse_crc32
++endif
++
+ RECOVERY_API_VERSION := 3
+ RECOVERY_FSTAB_VERSION := 2
+ LOCAL_CFLAGS += -DRECOVERY_API_VERSION=$(RECOVERY_API_VERSION)
+diff --git a/data.cpp b/data.cpp
+index 9a6674b..8a21be1 100755
+--- a/data.cpp
++++ b/data.cpp
+@@ -773,7 +773,10 @@ void DataManager::SetDefaultValues()
+     mConst.SetValue("fox_lab", "0");
+   #endif
+ 
+-  #ifdef OF_FLASHLIGHT_ENABLE 
++  #ifdef OF_JUDYLN_QPNP_TORCH
++    // UI state only. Never probe, reset or acquire the shared gate at startup.
++    mData.SetValue("of_flash_on", "0");
++  #elif defined(OF_FLASHLIGHT_ENABLE)
+     if (OF_FLASHLIGHT_ENABLE == "1") {
+       mConst.SetValue("of_fl_path_1", OF_FL_PATH1);
+       mConst.SetValue("of_fl_path_2", OF_FL_PATH2);
+@@ -1087,6 +1090,11 @@ void DataManager::SetDefaultValues()
+   mConst.SetValue(FOX_SURVIVAL_FOLDER_VAR, FOX_SURVIVAL_FOLDER);
+   mConst.SetValue(FOX_SURVIVAL_BACKUP_NAME, FOX_SURVIVAL_BACKUP);
+   mConst.SetValue(FOX_ACTUAL_BUILD_VAR, FOX_BUILD);
++  // Local UI/diagnostic identity, not the upstream release, type, or random build UUID.
++  if (strcmp(FOX_DEVICE, "judyln") == 0) {
++    mConst.SetValue("fox_display_version", FOX_MAIN_VERSION_STR " " FOX_BUILD_TYPE);
++    mConst.SetValue("fox_local_build", "20261121.1");
++  }
+   mConst.SetValue(FOX_TMP_SCRIPT_DIR, Fox_tmp_dir);
+   mConst.SetValue(FOX_COMPATIBILITY_DEVICE, FOX_DEVICE);
+   mData.SetValue("found_fox_overwriting_rom", 0);
+diff --git a/gui/action.cpp b/gui/action.cpp
+index 20fc1b9..2801ab6 100755
+--- a/gui/action.cpp
++++ b/gui/action.cpp
+@@ -54,6 +54,9 @@
+ #include "../twrpDigestDriver.hpp"
+ 
+ #include "../orangefox.hpp"
++#ifdef OF_JUDYLN_QPNP_TORCH
++#include "../judy_torch.hpp"
++#endif
+ 
+ extern "C" {
+ #include "../twcommon.h"
+@@ -1248,6 +1251,7 @@ int GUIAction::generatebackupname(std::string arg __unused)
+ 
+ int GUIAction::checkpartitionlist(std::string arg)
+ {
++  DataManager::SetValue("tw_partition_maintenance_arg", "");
+   string List, part_path;
+   int count = 0;
+ 
+@@ -1284,6 +1288,10 @@ int GUIAction::checkpartitionlist(std::string arg)
+ 
+ int GUIAction::getpartitiondetails(std::string arg)
+ {
++  // Failed lookups must not reuse capabilities from the previous selection.
++  DataManager::SetValue("tw_partition_can_format", 0);
++  DataManager::SetValue("tw_partition_can_repair", 0);
++  DataManager::SetValue("tw_partition_can_resize", 0);
+   string List, part_path;
+ 
+   if (arg.empty())
+@@ -1333,14 +1341,11 @@ int GUIAction::getpartitiondetails(std::string arg)
+ 	      DataManager::SetValue("tw_partition_is_present",
+ 				    Part->Is_Present);
+ 
+-	      if (Part->Can_Repair())
+-		DataManager::SetValue("tw_partition_can_repair", 1);
+-	      else
+-		DataManager::SetValue("tw_partition_can_repair", 0);
+-	      if (Part->Can_Resize())
+-		DataManager::SetValue("tw_partition_can_resize", 1);
+-	      else
+-		DataManager::SetValue("tw_partition_can_resize", 0);
++	      DataManager::SetValue("tw_partition_can_format", Part->Can_Format() ? 1 : 0);
++	      DataManager::SetValue("tw_partition_can_repair", Part->Can_Repair() ? 1 : 0);
++	      DataManager::SetValue("tw_partition_can_resize", Part->Can_Resize() ? 1 : 0);
++	      DataManager::SetValue("tw_partition_maintenance_arg", Part->Mount_Point +
++	                            (Part->Uses_Ext4_Maintenance() ? ":" + PartitionManager.Get_Active_Slot_Suffix() : ""));
+ 	      if (TWFunc::Path_Exists(Fox_Bin_Dir + "/mkfs.fat"))
+ 		DataManager::SetValue("tw_partition_vfat", 1);
+ 	      else
+@@ -2300,7 +2305,16 @@ int GUIAction::decrypt_backup(std::string arg __unused)
+   return 0;
+ }
+ 
+-int GUIAction::repair(std::string arg __unused)
++static bool RunPartitionMaintenance(const string& arg, bool grow) {
++  const auto separator = arg.find(':');
++  const auto mount = arg.substr(0, separator);
++  const string suffix = separator == string::npos ? "" : arg.substr(separator + 1);
++  if (separator != string::npos && (suffix != "_a" && suffix != "_b")) return false;
++  if (!suffix.empty() && suffix != PartitionManager.Get_Active_Slot_Suffix()) return false;
++  return grow ? PartitionManager.Resize_By_Path(mount, true, suffix) : PartitionManager.Repair_By_Path(mount, true, suffix);
++}
++
++int GUIAction::repair(std::string arg)
+ {
+   int op_status = 0;
+ 
+@@ -2311,9 +2325,7 @@ int GUIAction::repair(std::string arg __unused)
+     }
+   else
+     {
+-      string part_path;
+-      DataManager::GetValue("tw_partition_mount_point", part_path);
+-      if (PartitionManager.Repair_By_Path(part_path, true))
++      if (RunPartitionMaintenance(arg, false))
+ 	{
+ 	  op_status = 0;	// success
+ 	}
+@@ -2327,7 +2339,7 @@ int GUIAction::repair(std::string arg __unused)
+   return 0;
+ }
+ 
+-int GUIAction::resize(std::string arg __unused)
++int GUIAction::resize(std::string arg)
+ {
+   int op_status = 0;
+ 
+@@ -2338,9 +2350,7 @@ int GUIAction::resize(std::string arg __unused)
+     }
+   else
+     {
+-      string part_path;
+-      DataManager::GetValue("tw_partition_mount_point", part_path);
+-      if (PartitionManager.Resize_By_Path(part_path, true))
++      if (RunPartitionMaintenance(arg, true))
+ 	{
+ 	  op_status = 0;	// success
+ 	}
+@@ -2368,7 +2378,8 @@ int GUIAction::changefilesystem(std::string arg __unused)
+       string part_path, file_system;
+       DataManager::GetValue("tw_partition_mount_point", part_path);
+       DataManager::GetValue("tw_action_new_file_system", file_system);
+-      if (PartitionManager.Wipe_By_Path(part_path, file_system))
++      TWPartition *Part = PartitionManager.Find_Partition_By_Path(part_path);
++      if (Part && Part->Can_Format() && PartitionManager.Wipe_By_Path(part_path, file_system))
+ 	{
+ 	  op_status = 0;	// success
+ 	}
+@@ -2493,48 +2504,29 @@ int GUIAction::checkpartitionlifetimewrites(std::string arg)
+ 
+ int GUIAction::mountsystemtoggle(std::string arg)
+ {
+-	int op_status = 0;
+-	bool remount_system = PartitionManager.Is_Mounted_By_Path(PartitionManager.Get_Android_Root_Path());
+-	bool remount_vendor = PartitionManager.Is_Mounted_By_Path("/vendor");
+-
+ 	operation_start("Toggle System Mount");
+-	if (!PartitionManager.UnMount_By_Path(PartitionManager.Get_Android_Root_Path(), true)) {
+-		op_status = 1; // fail
+-	} else {
+-		TWPartition* Part = PartitionManager.Find_Partition_By_Path(PartitionManager.Get_Android_Root_Path());
+-		if (Part) {
+-			if (arg == "0") {
+-				DataManager::SetValue("tw_mount_system_ro", 0);
+-				Part->Change_Mount_Read_Only(false);
+-			} else {
+-				DataManager::SetValue("tw_mount_system_ro", 1);
+-				Part->Change_Mount_Read_Only(true);
+-			}
+-			if (remount_system) {
+-				Part->Mount(true);
+-			}
+-			op_status = 0; // success
+-		} else {
+-			op_status = 1; // fail
++	int op_status = 0;
++	const bool read_only = arg != "0";
++	const string root = PartitionManager.Get_Android_Root_Path();
++	const string paths[] = {root, "/vendor", "/OP"};
++	for (const auto& path : paths) {
++		if (path == "/OP" && strcmp(FOX_DEVICE, "judyln") != 0) continue;
++		TWPartition* part = PartitionManager.Find_Partition_By_Path(path);
++		if (!part) {
++			if (path == root) op_status = 1;
++			continue;
+ 		}
+-		Part = PartitionManager.Find_Partition_By_Path("/vendor");
+-		if (Part) {
+-			if (arg == "0") {
+-				Part->Change_Mount_Read_Only(false);
+-			} else {
+-				Part->Change_Mount_Read_Only(true);
+-			}
+-			if (remount_vendor) {
+-				Part->Mount(true);
+-			}
+-			op_status = 0; // success
+-		} else {
+-			op_status = 1; // fail
++		const bool mounted = part->Is_Mounted();
++		if (!part->UnMount(true) || part->Is_Mounted()) {
++			op_status = 1;
++			continue;
+ 		}
++		part->Change_Mount_Read_Only(read_only);
++		if (mounted && !part->Mount(true)) op_status = 1;
+ 	}
+-
++	if (!op_status) DataManager::SetValue("tw_mount_system_ro", strcmp(FOX_DEVICE, "judyln") == 0 ? 0 : (read_only ? 1 : 0));
+ 	operation_end(op_status);
+-	return 0;
++	return op_status;
+ }
+ 
+ int GUIAction::setlanguage(std::string arg __unused)
+@@ -2560,25 +2552,28 @@ int GUIAction::togglebacklight(std::string arg __unused)
+ int GUIAction::setbootslot(std::string arg)
+ {
+ 	operation_start("Set Boot Slot");
+-	if (!simulate) {
+-		if (!PartitionManager.UnMount_By_Path("/vendor", false)) {
+-			// PartitionManager failed to unmount /vendor, this should not happen,
+-			// but in case it does, do a lazy unmount
+-			LOGINFO("WARNING: vendor partition could not be unmounted normally!\n");
+-			umount2("/vendor", MNT_DETACH);
+-			PartitionManager.Set_Active_Slot(arg);
+-		} else {
+-			PartitionManager.Set_Active_Slot(arg);
+-		}
+-	} else {
+-		simulate_progress_bar();
++	int status = 0;
++	if (simulate) {
++		if (arg == "A" || arg == "B")
++			simulate_progress_bar();
++		else
++			status = 1;
++	} else if (!PartitionManager.Set_Active_Slot(arg)) {
++		status = 1;
+ 	}
+-	operation_end(0);
+-	return 0;
++	operation_end(status);
++	return status;
+ }
+ 
+ int GUIAction::flashlight(std::string arg __unused)
+ {
++#ifdef OF_JUDYLN_QPNP_TORCH
++	if (DataManager::GetStrValue(OF_FLASHLIGHT_ENABLE_STR) != "1") return 0;
++	const judy_torch::Result result = judy_torch::toggle(simulate);
++	if (result.icon >= 0) DataManager::SetValue("of_flash_on", result.icon);
++	if (result.error) gui_print_color("warning", "Flashlight: %s\n", result.error);
++	return result.error ? -1 : 0;
++#else
+     string enable_flash;
+     DataManager::GetValue(OF_FLASHLIGHT_ENABLE_STR, enable_flash);
+     if (enable_flash == "1") {
+@@ -2654,6 +2649,7 @@ int GUIAction::flashlight(std::string arg __unused)
+ 		}
+   }
+   return 0;
++#endif
+ }
+ 
+ int GUIAction::calldeactivateprocess(std::string arg __unused)
+diff --git a/mtp/ffs/MtpDevHandle.cpp b/mtp/ffs/MtpDevHandle.cpp
+index e22ba55..cf49503 100644
+--- a/mtp/ffs/MtpDevHandle.cpp
++++ b/mtp/ffs/MtpDevHandle.cpp
+@@ -60,9 +60,10 @@ int MtpDevHandle::sendEvent(mtp_event me) {
+ }
+ 
+ int MtpDevHandle::start(bool /* ptp */) {
+-	mFd.reset(TEMP_FAILURE_RETRY(open(mtp_dev_path, O_RDWR)));
+-	if (mFd == -1) return -1;
+-	return 0;
++	// The gadget is exclusive: reuse the fd from startup until disconnect.
++	if (mFd == -1)
++		mFd.reset(TEMP_FAILURE_RETRY(open(mtp_dev_path, O_RDWR | O_CLOEXEC)));
++	return mFd == -1 ? -1 : 0;
+ }
+ 
+ void MtpDevHandle::close() {
+diff --git a/mtp/ffs/mtp_MtpServer.cpp b/mtp/ffs/mtp_MtpServer.cpp
+index ce890d1..80eb309 100755
+--- a/mtp/ffs/mtp_MtpServer.cpp
++++ b/mtp/ffs/mtp_MtpServer.cpp
+@@ -74,7 +74,7 @@ void twmtp_MtpServer::start()
+ 		MTPD("Opening FFS EPO\n");
+ 		controlFd = open(FFS_MTP_EP0, O_RDWR);
+ 	} else {
+-		controlFd = open(mtp_device, O_WRONLY);
++		controlFd = TEMP_FAILURE_RETRY(open(mtp_device, O_RDWR | O_CLOEXEC));
+ 	}
+ 	if (controlFd < 0) {
+ 		MTPE("could not open MTP driver, errno: %d\n", errno);
+diff --git a/openrecoveryscript.cpp b/openrecoveryscript.cpp
+index f9af531..364235d 100755
+--- a/openrecoveryscript.cpp
++++ b/openrecoveryscript.cpp
+@@ -40,6 +40,7 @@
+ #include <sys/types.h>
+ #include <sys/wait.h>
+ #include <zlib.h>
++#include <android-base/strings.h>
+ 
+ #include "twrp-functions.hpp"
+ #include "partitions.hpp"
+@@ -65,6 +66,16 @@ OpenRecoveryScript::VoidFunction OpenRecoveryScript::call_after_cli_command;
+ 
+ #define SCRIPT_COMMAND_SIZE 512
+ 
++// Slot command failure must not become success/no-reboot or let another
++// queued script override the failure and trigger an automatic reboot.
++static constexpr int kSlotCommandFailed = 4;
++
++static bool ProbeBootControl() {
++	const bool ok = PartitionManager.Probe_Boot_Control();
++	gui_print("Judy bootctrl read-only probe: %s (details in recovery log)\n", ok ? "PASS" : "FAIL");
++	return ok;
++}
++
+ int OpenRecoveryScript::check_for_script_file(void) {
+ 	std::string logDir = TWFunc::get_log_dir();
+ 	std::string orsFile;
+@@ -312,26 +323,22 @@ int OpenRecoveryScript::run_script_file(void) {
+ 				else
+ 					gui_msg("done=Done.");
+ 			} else if (strcmp(command, "set_active") == 0) {
+-			#ifdef AB_OTA_UPDATER
+-				string aSlot = PartitionManager.Get_Active_Slot_Suffix();
+-				if (strlen(value) == 0) {
+-				    gui_print("Active slot=%s\n", aSlot.c_str());
+-				} 
+-				else {
+-				    string val = value;
+-				    gui_print("Active slot=%s\n", aSlot.c_str());
+-				    if (val == "_a" || val == "a" || val == "_A" || val == "A")
+-				    	aSlot = "A";
+-				    else if (val == "_b" || val == "b" || val == "_B" || val == "B")
+-				    	aSlot = "B";
+-				    LOGINFO("- OrangeFox: changing the active slot to slot %s\n", aSlot.c_str());
+-				    PartitionManager.Set_Active_Slot(aSlot);
+-				    aSlot = PartitionManager.Get_Active_Slot_Suffix();
+-				    gui_print("New active slot=%s\n", aSlot.c_str());
++				// Do not use the generic value parser, which rewrites some inputs.
++				string slot = android::base::Trim(cindex == 0 ? "" : script_line + cindex + 1);
++				if (cindex == 0) {
++					gui_print("Recovery selected slot=%s\n", PartitionManager.Get_Active_Slot_Suffix().c_str());
++				} else {
++					if (slot == "_a" || slot == "a" || slot == "_A")
++						slot = "A";
++					else if (slot == "_b" || slot == "b" || slot == "_B")
++						slot = "B";
++					if (!PartitionManager.Set_Active_Slot(slot)) {
++						gui_print("Slot selection failed; see recovery log for details\n");
++						ret_val = kSlotCommandFailed;
++					} else {
++						gui_print("Selected slot=%s\n", PartitionManager.Get_Active_Slot_Suffix().c_str());
++					}
+ 				}
+-			#else
+-			 	gui_print("A-only\n");
+-			#endif
+ 			} else if (strcmp(command, "remountrw") == 0) {
+ 				ret_val = remountrw();
+ 			} else if (strcmp(command, "mount") == 0) {
+@@ -476,6 +483,8 @@ int OpenRecoveryScript::run_script_file(void) {
+ 		}
+ 		fclose(fp);
+ 		unlink(SCRIPT_FILE_TMP);
++		if (ret_val == kSlotCommandFailed)
++			return ret_val;
+ 		gui_msg("done_ors=Done processing script file");
+ 		tmp_tmp = ret_val;
+ 		//* DJ9 - disable auto-reboot after incremental OTA updates? *//
+@@ -706,6 +715,10 @@ int OpenRecoveryScript::Run_OpenRecoveryScript_Action() {
+ 			op_status = 0;
+ 		}
+ 	}
++	if (code1 == kSlotCommandFailed) {
++		DataManager::SetValue("tw_page_done", 1);
++		return 1;
++	}
+ 	// Check for the ORS file in /cache and attempt to run those commands.
+ 	if (OpenRecoveryScript::check_for_script_file()) {
+ 		gui_msg("running_ors=Running OpenRecoveryScript");
+@@ -715,6 +728,10 @@ int OpenRecoveryScript::Run_OpenRecoveryScript_Action() {
+ 			op_status = 0;
+ 		}
+ 	}
++	if (code2 == kSlotCommandFailed) {
++		DataManager::SetValue("tw_page_done", 1);
++		return 1;
++	}
+ 	if (reboot || code1 == 3 || code2 == 3) 
+ 	   {	  
+     		// have we disabled auto-reboot?
+@@ -744,7 +761,13 @@ void OpenRecoveryScript::Run_CLI_Command(const char* command) {
+ 		TWFunc::Split_String(tmp, " ");  // pats[0] is cmd, parts[1...] is args
+ 	string cmd_str = parts[0];
+ 
+-	if (cmd_str == "runscript") {
++	if (cmd_str == "probe_bootctrl") {
++		// Go straight to the manager: no script file, mounts or partition work.
++		if (parts.size() == 1)
++			ProbeBootControl();
++		else
++			gui_print("probe_bootctrl takes no arguments\n");
++	} else if (cmd_str == "runscript") {
+ 		if (parts.size() > 1) {
+ 			string filename = parts[1];
+ 			if (OpenRecoveryScript::copy_script_file(filename) == 0) {
+diff --git a/partition.cpp b/partition.cpp
+index 49d4484..3c121ac 100644
+--- a/partition.cpp
++++ b/partition.cpp
+@@ -25,6 +25,7 @@
+ #include <sys/mount.h>
+ #include <sys/param.h>
+ #include <sys/stat.h>
++#include <sys/sysmacros.h>
+ #include <sys/types.h>
+ #include <sys/vfs.h>
+ #include <unistd.h>
+@@ -36,6 +37,15 @@
+ #include <pwd.h>
+ #include <zlib.h>
+ #include <sstream>
++#include <fstream>
++#include <cerrno>
++#include <sched.h>
++#include <linux/fs.h>
++#include <sys/ioctl.h>
++#include <android-base/unique_fd.h>
++#include <openssl/sha.h>
++#include <fstab/fstab.h>
++#include "ext4_maintenance.hpp"
+ 
+ #include "cutils/properties.h"
+ #include "libblkid/include/blkid.h"
+@@ -78,6 +88,7 @@ extern "C" {
+ #endif
+ #include <sparse_format.h>
+ #include "progresstracking.hpp"
++#include "image_validation.h"
+ 
+ using namespace std;
+ 
+@@ -155,6 +166,8 @@ enum TW_FSTAB_FLAGS {
+ 	TWFLAG_USERMRF,
+ 	TWFLAG_WIPEDURINGFACTORYRESET,
+ 	TWFLAG_WIPEINGUI,
++	TWFLAG_MANAGEMENT,
++	TWFLAG_AVB,
+ 	TWFLAG_SLOTSELECT,
+ 	TWFLAG_WAIT,
+ 	TWFLAG_VERIFY,
+@@ -203,6 +216,10 @@ const struct flag_list tw_flags[] = {
+ 	{ "usermrf",                TWFLAG_USERMRF },
+ 	{ "wipeduringfactoryreset", TWFLAG_WIPEDURINGFACTORYRESET },
+ 	{ "wipeingui",              TWFLAG_WIPEINGUI },
++	{ "management",             TWFLAG_MANAGEMENT },
++	{ "avb",                    TWFLAG_AVB },
++	{ "avb_keys=",              TWFLAG_AVB },
++	{ "verifyatboot",           TWFLAG_VERIFY },
+ 	{ "slotselect",             TWFLAG_SLOTSELECT },
+ 	{ "wait",                   TWFLAG_WAIT },
+ 	{ "verify",                 TWFLAG_VERIFY },
+@@ -227,6 +244,7 @@ TWPartition::TWPartition() {
+ 	Use_Rm_Rf = false;
+ 	Wipe_During_Factory_Reset = false;
+ 	Wipe_Available_in_GUI = false;
++	Management_Available_in_GUI = false;
+ 	Is_SubPartition = false;
+ 	Has_SubPartition = false;
+ 	SubPartition_Of = "";
+@@ -642,6 +660,10 @@ bool TWPartition::Process_Fstab_Line(const char *fstab_line, bool Display_Error,
+ 		}
+ 	}
+ 
++	// SlotSelect is set by the flags parsed above, after initial device setup.
++	if (SlotSelect && strcmp(FOX_DEVICE, "judyln") == 0)
++		Find_Actual_Block_Device();
++
+ 	if (Mount_Point == "/persist" && Can_Be_Mounted) {
+ 		bool mounted = Is_Mounted();
+ 		if (mounted || Mount(false)) {
+@@ -945,7 +967,6 @@ void TWPartition::Apply_TW_Flag(const unsigned flag, const char* str, const bool
+ 			break;
+ 		case TWFLAG_DEFAULTS:
+ 		case TWFLAG_WAIT:
+-		case TWFLAG_VERIFY:
+ 		case TWFLAG_CHECK:
+ 		case TWFLAG_NOTRIM:
+ 		case TWFLAG_VOLDMANAGED:
+@@ -1062,6 +1083,12 @@ void TWPartition::Apply_TW_Flag(const unsigned flag, const char* str, const bool
+ 				Wipe_Available_in_GUI = true;
+ 			}
+ 			break;
++		case TWFLAG_MANAGEMENT:
++			Management_Available_in_GUI = val;
++			break;
++		case TWFLAG_AVB:
++		case TWFLAG_VERIFY:
++			break;
+ 		case TWFLAG_WIPEINGUI:
+ 		case TWFLAG_FORMATTABLE:
+ 			Wipe_Available_in_GUI = val;
+@@ -1546,20 +1573,80 @@ bool TWPartition::Is_File_System_Writable(void) {
+ 	return (access(test_path.c_str(), W_OK) == 0);
+ }
+ 
++namespace {
++std::string ProbeFilesystem(int fd);
++bool OfflineDevice(dev_t dev);
++bool MountedReadWrite(const std::string& path, dev_t dev);
++}
++
+ bool TWPartition::Mount(bool Display_Error) {
+ 	int exfat_mounted = 0;
+ 	unsigned int flags = Mount_Flags;
+ 
+ 	if (Is_Mounted()) {
+-		return true;
++		if (!Uses_Ext4_Maintenance()) return true;
++		const string node = Get_Judy_Slot_Block_Device(PartitionManager.Get_Active_Slot_Suffix());
++		android::base::unique_fd fd(open(node.c_str(), O_RDONLY | O_CLOEXEC));
++		const string type = fd < 0 ? "" : ProbeFilesystem(fd);
++		struct stat st;
++		if (type == "ext4" && !fstat(fd, &st) && MountedReadWrite(Mount_Point, st.st_rdev)) {
++			Mount_Read_Only = false;
++			return true;
++		}
++		if (type == "erofs" && !fstat(fd, &st)) {
++			struct stat mounted;
++			struct statfs fs;
++			if (!stat(Mount_Point.c_str(), &mounted) && mounted.st_dev == st.st_rdev &&
++			    !statfs(Mount_Point.c_str(), &fs) && (fs.f_flags & MS_RDONLY)) {
++				Mount_Read_Only = true;
++				return true;
++			}
++		}
++		if (type.empty() || !UnMount(Display_Error) || Is_Mounted()) return false;
+ 	} else if (!Can_Be_Mounted) {
+ 		return false;
+ 	}
+ 
+ 	Find_Actual_Block_Device();
++	if (SlotSelect && strcmp(FOX_DEVICE, "judyln") == 0 && !Is_Present)
++		return false;
+ 
+ 	// Check the current file system before mounting
+ 	Check_FS_Type();
++	if (Uses_Ext4_Maintenance()) {
++		flags &= ~MS_RDONLY;
++		const string suffix = PartitionManager.Get_Active_Slot_Suffix();
++		const string node = Get_Judy_Slot_Block_Device(suffix);
++		android::base::unique_fd fd(open(node.c_str(), O_RDONLY | O_CLOEXEC));
++		Current_File_System = fd < 0 ? "" : ProbeFilesystem(fd);
++		bool ok = false;
++		string error = "Cannot identify filesystem from a fresh probe";
++		if (Current_File_System == "ext4") {
++			Mount_Read_Only = false;
++			MaintenanceTarget info;
++			dev_t dev;
++			const string reason = Inspect_Ext4_Target(fd, suffix, &dev, &info);
++			if (!reason.empty()) error = reason;
++			else if (!info.rw_block.empty()) error = info.rw_block;
++			else if (!OfflineDevice(dev)) error = "Device is still mounted or has holders";
++			else {
++				struct stat st;
++				const string pinned = "/proc/self/fd/" + to_string(fd.get());
++				if (suffix != PartitionManager.Get_Active_Slot_Suffix() || stat(node.c_str(), &st) || st.st_rdev != dev)
++					error = "Selected slot or device changed";
++				else if (mount(pinned.c_str(), Mount_Point.c_str(), "ext4", flags, Mount_Options.c_str()))
++					error = strerror(errno);
++				else if (!(ok = MountedReadWrite(Mount_Point, dev)))
++					error = "Kernel did not mount ext4 read/write";
++			}
++		} else if (Current_File_System == "erofs") {
++			Mount_Read_Only = true;
++			ok = !mount(node.c_str(), Mount_Point.c_str(), "erofs", flags | MS_RDONLY, nullptr);
++			if (!ok) error = strerror(errno);
++		}
++		if (!ok && Display_Error) gui_msg(Msg(msg::kError, "fail_mount=Failed to mount '{1}' ({2})")(Mount_Point)(error));
++		return ok;
++	}
+ 	if (Current_File_System == "exfat" && TWFunc::Path_Exists("system/bin/exfat-fuse")) {
+ 		string cmd = "/system/bin/exfat-fuse -o big_writes,max_read=131072,max_write=131072 " + Actual_Block_Device + " " + Mount_Point;
+ 		LOGINFO("cmd: %s\n", cmd.c_str());
+@@ -1759,7 +1846,7 @@ bool TWPartition::Wipe(string New_File_System) {
+ 	bool wiped = false, update_crypt = false, recreate_media = true;
+ 	int check;
+ 
+-	if (!Can_Be_Wiped) {
++	if (Uses_Ext4_Maintenance() || !Can_Be_Wiped) {
+ 		gui_msg(Msg(msg::kError, "cannot_wipe=Partition {1} cannot be wiped.")(Display_Name));
+ 		return false;
+ 	}
+@@ -1860,7 +1947,309 @@ bool TWPartition::Wipe_AndSec(void) {
+ 	return true;
+ }
+ 
++bool TWPartition::Can_Format() {
++	return !Uses_Ext4_Maintenance() && Can_Be_Wiped && !Mount_Read_Only;
++}
++
++namespace {
++using android::base::unique_fd;
++using namespace ext4_maintenance;
++
++constexpr char kByName[] = "/dev/block/bootdevice/by-name/";
++constexpr char kFsck[] = "/system/bin/e2fsck";
++constexpr char kResize[] = "/system/bin/resize2fs";
++
++string DevId(dev_t dev) {
++	return to_string(major(dev)) + ":" + to_string(minor(dev));
++}
++
++bool HasPartName(dev_t dev, const string& name) {
++	ifstream input("/sys/dev/block/" + DevId(dev) + "/uevent");
++	string line;
++	while (getline(input, line))
++		if (line == "PARTNAME=" + name) return true;
++	return false;
++}
++
++bool OfflineDevice(dev_t dev) {
++	ifstream mounts("/proc/self/mountinfo");
++	if (!Offline(mounts, DevId(dev))) return false;  // Includes bind mounts and aliases.
++	DIR* holders = opendir(("/sys/dev/block/" + DevId(dev) + "/holders").c_str());
++	if (!holders) return false;
++	bool empty = true;
++	errno = 0;
++	while (const auto* entry = readdir(holders)) {
++		if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..")) {
++			empty = false;
++			break;
++		}
++	}
++	empty = empty && !errno;
++	closedir(holders);
++	return empty;
++}
++
++// Read only exact GPT metadata partitions. The limit bounds allocation, not a
++// device capacity policy; larger/unreadable metadata blocks growth only.
++bool ReadMetadataPartition(const string& name, std::vector<uint8_t>* image, string* snapshot) {
++	unique_fd fd(open((string(kByName) + name).c_str(), O_RDONLY | O_CLOEXEC));
++	struct stat st;
++	uint64_t bytes = 0;
++	if (fd < 0 || fstat(fd, &st) || !S_ISBLK(st.st_mode) || !HasPartName(st.st_rdev, name) ||
++	    ioctl(fd, BLKGETSIZE64, &bytes) || !bytes || bytes > 16 * 1024 * 1024) return false;
++	image->resize(bytes);
++	if (pread64(fd, image->data(), image->size(), 0) != static_cast<ssize_t>(image->size())) return false;
++	unsigned char digest[SHA256_DIGEST_LENGTH];
++	SHA256(image->data(), image->size(), digest);
++	*snapshot += name + ":" + DevId(st.st_rdev) + ":" + to_string(bytes) + ":";
++	snapshot->append(reinterpret_cast<const char*>(digest), sizeof(digest));
++	return true;
++}
++
++string RuntimeGrowthBounds(int fd, const string& partition, const string& suffix,
++                           uint64_t physical, uint64_t* ceiling, string* snapshot) {
++	AvbBounds bounds{partition, suffix, "", physical, physical};
++	AvbFooter raw, footer;
++	if (pread64(fd, &raw, sizeof(raw), physical - sizeof(raw)) != sizeof(raw))
++		return "Cannot read AVB footer area";
++	snapshot->assign(reinterpret_cast<const char*>(&raw), sizeof(raw));
++	std::vector<uint8_t> embedded;
++	if (!memcmp(raw.magic, AVB_FOOTER_MAGIC, AVB_FOOTER_MAGIC_LEN)) {
++		if (!avb_footer_validate_and_byteswap(&raw, &footer) || !footer.original_image_size ||
++		    footer.original_image_size > footer.vbmeta_offset ||
++		    !footer.vbmeta_size || footer.vbmeta_size > 16 * 1024 * 1024 ||
++		    !Interval(footer.vbmeta_offset, footer.vbmeta_size, physical - sizeof(raw)))
++			return "Invalid AVB footer intervals";
++		bounds.ceiling = footer.original_image_size;
++		// Trees and FEC must also end before the embedded vbmeta region.
++		bounds.physical = footer.vbmeta_offset;
++		embedded.resize(footer.vbmeta_size);
++		if (pread64(fd, embedded.data(), embedded.size(), footer.vbmeta_offset) != static_cast<ssize_t>(embedded.size()))
++			return "Cannot read footer AVB metadata";
++		unsigned char digest[SHA256_DIGEST_LENGTH];
++		SHA256(embedded.data(), embedded.size(), digest);
++		snapshot->append(reinterpret_cast<const char*>(digest), sizeof(digest));
++		if (!ReadAvbBounds(embedded, &bounds)) return bounds.error;
++	}
++	std::vector<uint8_t> external;
++	if (!ReadMetadataPartition("vbmeta" + suffix, &external, snapshot))
++		return "Cannot read complete selected-slot vbmeta";
++	if (!ReadAvbBounds(external, &bounds)) return bounds.error;
++	// A complete readable descriptor set with no target descriptor and no footer
++	// is the supported plain-ext4 case. Absence of a footer alone proves nothing.
++	if (bounds.disabled_flags_layout)
++		LOGINFO("Ext4 growth: verification disabled metadata; layout checked using flags-normalized private copy (not boot authentication)\n");
++	LOGINFO("Ext4 growth %s physical=%llu writable=%llu source=%s\n", partition.c_str(),
++	        static_cast<unsigned long long>(physical), static_cast<unsigned long long>(bounds.ceiling),
++	        bounds.matched ? "AVB descriptor/footer bounds" : (embedded.empty() ? "complete vbmeta: plain ext4" : "AVB footer"));
++	*ceiling = bounds.ceiling;
++	return "";
++}
++
++string ProbeFilesystem(int fd) {
++	blkid_probe probe = blkid_new_probe();
++	if (!probe) return "";
++	const char* type = nullptr;
++	string result;
++	if (blkid_probe_set_device(probe, fd, 0, 0) == 0 && blkid_do_safeprobe(probe) == 0 &&
++	    blkid_probe_lookup_value(probe, "TYPE", &type, nullptr) == 0 && type)
++		result = type;
++	blkid_free_probe(probe);
++	return result;
++}
++
++bool MountedReadWrite(const string& path, dev_t dev) {
++	struct stat st;
++	struct statfs fs;
++	return !stat(path.c_str(), &st) && st.st_dev == dev && !statfs(path.c_str(), &fs) && !(fs.f_flags & MS_RDONLY);
++}
++
++int RunMaintenanceTool(int fd, dev_t dev, bool grow, const string& blocks) {
++	const string target = "/proc/self/fd/" + to_string(fd);
++	const pid_t child = fork();
++	if (child == 0) {
++		// A mount propagated between preflight and exec must not switch resize2fs
++		// to its online path (or cause e2fsck -f to drop its exclusive open).
++		if (unshare(CLONE_NEWNS) || mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ||
++		    !OfflineDevice(dev)) _exit(125);
++		if (grow) execl(kResize, "resize2fs", target.c_str(), blocks.c_str(), nullptr);
++		else execl(kFsck, "e2fsck", "-fp", target.c_str(), nullptr);
++		_exit(127);
++	}
++	int status;
++	return child > 0 && TEMP_FAILURE_RETRY(waitpid(child, &status, 0)) == child ? status : -1;
++}
++}  // namespace
++
++bool TWPartition::Uses_Ext4_Maintenance() const {
++	return strcmp(FOX_DEVICE, "judyln") == 0 &&
++	       (Mount_Point == "/system_root" || Mount_Point == "/vendor" || Mount_Point == "/OP");
++}
++
++string TWPartition::Inspect_Ext4_Target(int fd, const string& suffix, dev_t* dev, MaintenanceTarget* info) {
++	if (!Uses_Ext4_Maintenance()) return "Maintenance not enabled";
++	if ((suffix != "_a" && suffix != "_b") || suffix != PartitionManager.Get_Active_Slot_Suffix())
++		return "Selected slot unavailable or changed";
++	const string base = Mount_Point == "/system_root" ? "system" : Mount_Point.substr(1);
++	const string partition = base + suffix;
++	struct stat st;
++	if (fd < 0 || fstat(fd, &st) || !S_ISBLK(st.st_mode) || !HasPartName(st.st_rdev, partition))
++		return "Exact slot device unavailable";
++	*dev = st.st_rdev;
++	if (ioctl(fd, BLKGETSIZE64, &info->device_bytes) || info->device_bytes < 2048)
++		return "Cannot read physical size";
++	info->filesystem = ProbeFilesystem(fd);
++	unsigned char sb[1024] = {};
++	const bool have_sb = pread64(fd, sb, sizeof(sb), 1024) == sizeof(sb);
++	if (have_sb) info->filesystem_bytes = FilesystemBytes(info->filesystem, sb, info->device_bytes);
++	if (info->filesystem == "erofs") return "EROFS is read-only";
++	if (info->filesystem.empty()) return "Cannot identify filesystem";
++	if (info->filesystem != "ext4") return "Fresh probe is not ext4";
++	if (!have_sb || !info->filesystem_bytes) return "Cannot read ext4 geometry";
++	if (!SlotSelect || Original_Path != kByName + base || Fstab_File_System != "ext4" ||
++	    Is_Encrypted || Is_Decrypted || Is_Super || !Alternate_Block_Device.empty()) return "Not a raw slot ext4 entry";
++	int ro = 1;
++	if (ioctl(fd, BLKROGET, &ro) || ro)
++		info->rw_block = info->repair_block = "Block device is read-only";
++	const auto fs = ReadGeometry(sb);
++	if (HasExternalJournal(sb)) return "Ext4 has an external journal";
++	info->block_bytes = fs.block_bytes;
++	// Metadata limits growth only: historical descriptors must not prevent RW/repair.
++	info->grow_block = RuntimeGrowthBounds(fd, partition, suffix, info->device_bytes,
++	                                     &info->writable_bytes, &info->metadata_snapshot);
++	if (info->grow_block.empty()) info->grow_blocks = Growth(fs, info->writable_bytes);
++	if (const char* reason = Mount_Write_Block(info->filesystem, sb)) info->rw_block = reason;
++	if (info->repair_block.empty() && access(kFsck, X_OK)) info->repair_block = "e2fsck unavailable";
++	if (!info->repair_block.empty()) info->grow_block = info->repair_block;
++	else if (access(kResize, X_OK)) info->grow_block = "resize2fs unavailable";
++	else if (info->grow_block.empty() && !info->grow_blocks) info->grow_block = "No growth space within runtime AVB/physical bounds";
++	return "";
++}
++
++bool TWPartition::Has_Actual_Ext4() {
++	const string node = Get_Judy_Slot_Block_Device(PartitionManager.Get_Active_Slot_Suffix());
++	unique_fd fd(open(node.c_str(), O_RDONLY | O_CLOEXEC));
++	return fd >= 0 && ProbeFilesystem(fd) == "ext4";
++}
++
++bool TWPartition::Run_Ext4_Maintenance(bool grow, const string& suffix) {
++	const auto fail = [](const string& reason) {
++		gui_msg(Msg(msg::kError, "ext4_maintenance_blocked=Ext4 maintenance: {1}")(reason));
++		return false;
++	};
++	const auto node = Get_Judy_Slot_Block_Device(suffix);
++	// Keep the inspected device pinned across both execs. The tools acquire their
++	// own exclusive kernel block claims; a persistent exclusive fd would deadlock them.
++	unique_fd fd(open(node.c_str(), O_RDONLY));
++	dev_t dev;
++	MaintenanceTarget info;
++	const auto preflight = [&] {
++		info = {};
++		const auto reason = Inspect_Ext4_Target(fd, suffix, &dev, &info);
++		return reason;
++	};
++	const auto reason = preflight();
++	if (!reason.empty()) return fail(reason);
++	// Refresh this object only, without mounting (in particular, never honor an
++	// always-RW preference just to obtain counters). Keep using the pinned slot fd.
++	const auto refresh = [&] {
++		const auto selected = [&] {
++			struct stat st, pinned;
++			return suffix == PartitionManager.Get_Active_Slot_Suffix() &&
++			       !stat(node.c_str(), &st) && !fstat(fd, &pinned) &&
++			       S_ISBLK(st.st_mode) && S_ISBLK(pinned.st_mode) &&
++			       st.st_rdev == dev && pinned.st_rdev == dev && HasPartName(dev,
++			       (Mount_Point == "/system_root" ? "system" : Mount_Point.substr(1)) + suffix);
++		};
++		if (!selected()) return fail("Maintenance completed, but statistics refresh failed: selected device changed");
++		uint64_t size = 0, used = 0, free = 0;
++		struct stat mounted;
++		if (!stat((Mount_Point + "/.").c_str(), &mounted) && mounted.st_dev == dev) {
++			// Mounted counters are live; the on-disk superblock can be stale.
++			struct statfs fs;
++			if (statfs(Mount_Point.c_str(), &fs) || fs.f_bsize <= 0 ||
++			    fs.f_bfree > fs.f_blocks || uint64_t(fs.f_blocks) > UINT64_MAX / uint64_t(fs.f_bsize))
++				return fail("Maintenance completed, but statistics refresh failed: invalid mounted counters");
++			size = uint64_t(fs.f_blocks) * fs.f_bsize;
++			free = uint64_t(fs.f_bfree) * fs.f_bsize;
++			used = size - free;
++		} else {
++			unsigned char sb[1024] = {};
++			if (!OfflineDevice(dev) || pread64(fd, sb, sizeof(sb), 1024) != sizeof(sb) ||
++			    !ReadUsage(sb, info.device_bytes, &size, &used, &free))
++				return fail("Maintenance completed, but statistics refresh failed: cannot read offline counters");
++		}
++		if (!selected()) return fail("Maintenance completed, but statistics refresh failed: selected device changed");
++		Size = size;
++		Used = used;
++		Free = free;
++		Backup_Size = used;
++		return true;
++	};
++	bool at_limit = info.block_bytes && info.filesystem_bytes / info.block_bytes == info.device_bytes / info.block_bytes;
++	if (!at_limit && info.writable_bytes && info.grow_block == "No growth space within runtime AVB/physical bounds") {
++		unsigned char sb[1024] = {};
++		if (pread64(fd, sb, sizeof(sb), 1024) == sizeof(sb)) {
++			const auto fs = ReadGeometry(sb);
++			const auto ceiling = GrowthCeiling(fs, info.writable_bytes);
++			at_limit = Fits(fs, info.writable_bytes) && ceiling && ceiling <= fs.blocks;
++		}
++	}
++	if (grow && at_limit) {
++		gui_msg("ext4_resize_full=Filesystem already at usable limit; no resize needed.");
++		return refresh();
++	}
++	if (!(grow ? info.grow_block : info.repair_block).empty())
++		return fail(grow ? info.grow_block : info.repair_block);
++	if (!UnMount(true) || Is_Mounted() || !OfflineDevice(dev)) return fail("Device is still mounted or has holders");
++	const auto admitted = info;
++	const auto recheck = preflight();
++	if (!recheck.empty()) return fail(recheck);
++	if (!(grow ? info.grow_block : info.repair_block).empty()) return fail(grow ? info.grow_block : info.repair_block);
++	if (info.device_bytes != admitted.device_bytes || info.writable_bytes != admitted.writable_bytes ||
++	    info.metadata_snapshot != admitted.metadata_snapshot) return fail("Physical bounds or AVB metadata changed");
++	const auto still_selected = [&] {
++		struct stat st;
++		return suffix == PartitionManager.Get_Active_Slot_Suffix() && !stat(node.c_str(), &st) &&
++		       S_ISBLK(st.st_mode) && st.st_rdev == dev && OfflineDevice(dev);
++	};
++	if (!still_selected()) return fail("Device state changed");
++	{
++		const string pinned = "/proc/self/fd/" + to_string(fd.get());
++		unique_fd exclusive(open(pinned.c_str(), O_RDONLY | O_EXCL | O_CLOEXEC));
++		if (exclusive < 0) return fail("Block device busy");
++	}
++	const auto before = info;
++	int status = RunMaintenanceTool(fd, dev, false, "");
++	LOGINFO("Offline e2fsck %s wait status: %d\n", node.c_str(), status);
++	if (!ToolSucceeded(status, true))
++		return fail("e2fsck failed (wait status " + to_string(status) + ")");
++	if (!still_selected()) return fail("Device state changed after repair");
++	const auto after_repair = preflight();
++	if (!after_repair.empty()) return fail(after_repair);
++	if (info.device_bytes != before.device_bytes || info.writable_bytes != before.writable_bytes ||
++	    info.metadata_snapshot != before.metadata_snapshot) return fail("Physical bounds or AVB metadata changed after repair");
++	if (!grow) return refresh();
++	if (!info.grow_block.empty()) return fail(info.grow_block);
++	if (info.block_bytes != before.block_bytes || info.grow_blocks != before.grow_blocks ||
++	    info.filesystem_bytes > before.grow_blocks * before.block_bytes || !still_selected())
++		return fail("Device state or growth bounds changed");
++	status = RunMaintenanceTool(fd, dev, true, to_string(before.grow_blocks));
++	LOGINFO("Offline resize2fs %s wait status: %d\n", node.c_str(), status);
++	if (!ToolSucceeded(status, false)) return fail("resize2fs failed (wait status " + to_string(status) + ")");
++	info = {};
++	const auto after_grow = Inspect_Ext4_Target(fd, suffix, &dev, &info);
++	if (!after_grow.empty()) return fail(after_grow);
++	if (!still_selected() || info.device_bytes != before.device_bytes ||
++	    info.writable_bytes != before.writable_bytes || info.metadata_snapshot != before.metadata_snapshot)
++		return fail("Physical bounds or AVB metadata changed after resize");
++	if (info.block_bytes != before.block_bytes || info.filesystem_bytes != before.grow_blocks * before.block_bytes)
++		return fail("Unexpected size after resize");
++	return refresh();
++}
++
+ bool TWPartition::Can_Repair() {
++	if (Uses_Ext4_Maintenance()) return Has_Actual_Ext4() && !access(kFsck, X_OK);
+ 	if (Mount_Read_Only)
+ 		return false;
+ 	if (Current_File_System == "vfat" && TWFunc::Path_Exists("/system/bin/fsck.fat"))
+@@ -1876,7 +2265,10 @@ bool TWPartition::Can_Repair() {
+ 	return false;
+ }
+ 
+-bool TWPartition::Repair() {
++bool TWPartition::Repair(const string& suffix) {
++	if (Uses_Ext4_Maintenance()) return Run_Ext4_Maintenance(false, suffix.empty() ? PartitionManager.Get_Active_Slot_Suffix() : suffix);
++	if (!Can_Repair())
++		return false;
+ 	string command;
+ 
+ 	if (Current_File_System == "vfat") {
+@@ -1983,6 +2375,7 @@ bool TWPartition::Repair() {
+ }
+ 
+ bool TWPartition::Can_Resize() {
++	if (Uses_Ext4_Maintenance()) return Has_Actual_Ext4() && !access(kResize, X_OK);
+ 	if (Mount_Read_Only)
+ 		return false;
+ 	if ((Current_File_System == "ext2" || Current_File_System == "ext3" || Current_File_System == "ext4") && TWFunc::Path_Exists("/system/bin/resize2fs"))
+@@ -1990,7 +2383,10 @@ bool TWPartition::Can_Resize() {
+ 	return false;
+ }
+ 
+-bool TWPartition::Resize() {
++bool TWPartition::Resize(const string& suffix) {
++	if (Uses_Ext4_Maintenance()) return Run_Ext4_Maintenance(true, suffix.empty() ? PartitionManager.Get_Active_Slot_Suffix() : suffix);
++	if (!Can_Resize() || !Can_Repair())
++		return false;
+ 	string command;
+ 
+ 	if (Current_File_System == "ext2" || Current_File_System == "ext3" || Current_File_System == "ext4") {
+@@ -3153,7 +3549,46 @@ bool TWPartition::Find_Wildcard_Block_Devices(const string& Device) {
+ 	return (mount_point_index > 0);
+ }
+ 
++string TWPartition::Get_Judy_Slot_Block_Device(const string& suffix) const {
++	static const string by_name = "/dev/block/bootdevice/by-name/";
++	if ((suffix != "_a" && suffix != "_b") || Original_Path.compare(0, by_name.size(), by_name) != 0)
++		return "";
++	const string name = Original_Path.substr(by_name.size()) + suffix;
++	if (name.size() <= suffix.size() || name.find('/') != string::npos)
++		return "";
++	const string node = by_name + name;
++	struct stat st;
++	if (stat(node.c_str(), &st) != 0 || !S_ISBLK(st.st_mode))
++		return "";
++
++	// A suffixed link to the wrong block device is not a valid slot target.
++	const string uevent = "/sys/dev/block/" + to_string(major(st.st_rdev)) + ":" +
++		to_string(minor(st.st_rdev)) + "/uevent";
++	FILE* fp = fopen(uevent.c_str(), "re");
++	if (!fp)
++		return "";
++	const string expected = "PARTNAME=" + name + "\n";
++	char line[256];
++	bool matches = false;
++	while (fgets(line, sizeof(line), fp)) {
++		if (expected == line) {
++			matches = true;
++			break;
++		}
++	}
++	fclose(fp);
++	return matches ? node : "";
++}
++
+ void TWPartition::Find_Actual_Block_Device(void) {
++	if (SlotSelect && strcmp(FOX_DEVICE, "judyln") == 0) {
++		Actual_Block_Device = Get_Judy_Slot_Block_Device(PartitionManager.Get_Active_Slot_Suffix());
++		Is_Present = !Actual_Block_Device.empty();
++		if (Is_File_System(Fstab_File_System))
++			Can_Be_Mounted = Is_Present;
++		// Do not synthesize unsuffixed aliases: the legacy HAL counts boot* entries.
++		return;
++	}
+ 	if (!Sysfs_Entry.empty() && Primary_Block_Device.empty() && Decrypted_Block_Device.empty()) {
+ 		/* Sysfs_Entry.empty() indicates if this is a sysfs entry that begins with /device/
+ 		 * If we have a syfs entry then we are looking for this device from a uevent add.
+@@ -3291,18 +3726,24 @@ bool TWPartition::Flash_Image(PartitionSettings *part_settings) {
+ 			LOGERR("Unable to find partition size for '%s'\n", Mount_Point.c_str());
+ 			return false;
+ 		}
+-		unsigned long long image_size = TWFunc::Get_File_Size(full_filename);
+-		if (image_size > Size) {
+-			LOGINFO("Size (%llu bytes) of image '%s' is larger than target device '%s' (%llu bytes)\n",
+-				image_size, Backup_FileName.c_str(), Actual_Block_Device.c_str(), Size);
+-			gui_err("img_size_err=Size of image is larger than target device");
++		// Size discovery can re-resolve Actual_Block_Device; check its final value.
++		if (!image_validation::ValidateFlashTarget(SlotSelect, Primary_Block_Device,
++				PartitionManager.Get_Active_Slot_Suffix(), Actual_Block_Device,
++				image_validation::IsBlockDevice)) {
++			LOGERR("Refusing image flash: selected slot target is missing, not a block device, or does not match '%s'\n",
++				Actual_Block_Device.c_str());
++			return false;
++		}
++		uint64_t image_size = 0;
++		bool sparse = false;
++		if (!image_validation::Validate(full_filename, Size, &image_size, &sparse)) {
++			LOGERR("Image preflight failed for '%s': empty, unreadable, malformed, unknown target size, or oversized image\n",
++				full_filename.c_str());
+ 			return false;
+ 		}
+ 		if (Backup_Method == BM_DD) {
+-			if (!part_settings->adbbackup) {
+-				if (Is_Sparse_Image(full_filename)) {
+-					return Flash_Sparse_Image(full_filename);
+-				}
++			if (!part_settings->adbbackup && sparse) {
++				return Flash_Sparse_Image(full_filename);
+ 			}
+ 			return Raw_Read_Write(part_settings);
+ 		} else if (Backup_Method == BM_FLASH_UTILS) {
+@@ -3334,14 +3775,14 @@ bool TWPartition::Is_Sparse_Image(const string& Filename) {
+ }
+ 
+ bool TWPartition::Flash_Sparse_Image(const string& Filename) {
+-	string Command;
+ 
+ 	gui_msg(Msg("flashing=Flashing {1}...")(Display_Name));
+ 
+-	Command = "simg2img '" + Filename + "' '" + Actual_Block_Device + "'";
+-	LOGINFO("Flash command: '%s'\n", Command.c_str());
+-	TWFunc::Exec_Cmd(Command);
+-	return true;
++	return image_validation::ExecuteSparse(Filename, Actual_Block_Device,
++		[](const string& command) {
++			LOGINFO("Flash command: '%s'\n", command.c_str());
++			return TWFunc::Exec_Cmd(command);
++		});
+ }
+ 
+ bool TWPartition::Flash_Image_FI(const string& Filename, ProgressTracking *progress) {
+@@ -3366,7 +3807,14 @@ bool TWPartition::Flash_Image_FI(const string& Filename, ProgressTracking *progr
+ }
+ 
+ void TWPartition::Change_Mount_Read_Only(bool new_value) {
+-	Mount_Read_Only = new_value;
++	if (Uses_Ext4_Maintenance()) {
++		const string node = Get_Judy_Slot_Block_Device(PartitionManager.Get_Active_Slot_Suffix());
++		unique_fd fd(open(node.c_str(), O_RDONLY | O_CLOEXEC));
++		const string type = fd < 0 ? "" : ProbeFilesystem(fd);
++		Mount_Read_Only = type != "ext4";
++	} else Mount_Read_Only = new_value;
++	if (Mount_Read_Only) Mount_Flags |= MS_RDONLY;
++	else Mount_Flags &= ~MS_RDONLY;
+ }
+ 
+ bool TWPartition::Is_Read_Only() {
+diff --git a/partitionmanager.cpp b/partitionmanager.cpp
+index beb580d..1878473 100755
+--- a/partitionmanager.cpp
++++ b/partitionmanager.cpp
+@@ -110,6 +110,11 @@ extern "C" {
+ #endif
+ 
+ #ifdef AB_OTA_UPDATER
++#include <algorithm>
++#include <dlfcn.h>
++#include <link.h>
++#include <mntent.h>
++#include <mutex>
+ #include <hardware/hardware.h>
+ #include <hardware/boot_control.h>
+ #endif
+@@ -120,21 +125,141 @@ using android::fs_mgr::FstabEntry;
+ extern bool datamedia;
+ std::vector<users_struct> Users_List;
+ 
++#ifdef AB_OTA_UPDATER
++namespace {
++constexpr char kJudyBootControl[] = "/system/lib64/hw/bootctrl.judyln-fox.so";
++constexpr char kJudyUpdater[] = "/system/lib64/librecovery_updater_msm.so";
++constexpr char kUpdaterSoname[] = "librecovery_updater_msm.so";
++
++int CheckResidentJudyUpdater(dl_phdr_info* info, size_t, void*) {
++	// Android's linker can satisfy DT_NEEDED from a resident object's SONAME
++	// before searching the filesystem, even if it was opened under another name.
++	for (size_t i = 0; i < info->dlpi_phnum; ++i) {
++		const auto& phdr = info->dlpi_phdr[i];
++		if (phdr.p_type != PT_DYNAMIC)
++			continue;
++		const auto* dyn = reinterpret_cast<const ElfW(Dyn)*>(info->dlpi_addr + phdr.p_vaddr);
++		const char* strings = nullptr;
++		size_t soname = 0;
++		for (size_t j = 0; j < phdr.p_memsz / sizeof(*dyn) && dyn[j].d_tag != DT_NULL; ++j) {
++			if (dyn[j].d_tag == DT_STRTAB)
++				strings = reinterpret_cast<const char*>(info->dlpi_addr + dyn[j].d_un.d_ptr);
++			else if (dyn[j].d_tag == DT_SONAME)
++				soname = dyn[j].d_un.d_val;
++		}
++		if (strings && soname && strcmp(strings + soname, kUpdaterSoname) == 0 &&
++				strcmp(info->dlpi_name, kJudyUpdater) != 0) {
++			LOGERR("Judy bootctrl: conflicting resident %s: %s\n", kUpdaterSoname, info->dlpi_name);
++			return 1;
++		}
++	}
++	return 0;
++}
++
++void* OpenJudyLibrary(const char* path) {
++	void* handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
++	if (!handle)
++		LOGERR("Judy bootctrl: dlopen %s failed: %s\n", path, dlerror());
++	return handle;
++}
++
++bool SymbolIsFrom(void* symbol, const char* path) {
++	Dl_info info = {};
++	return symbol && dladdr(symbol, &info) && info.dli_fname && strcmp(info.dli_fname, path) == 0;
++}
++
++boot_control_module_t* LoadJudyBootControl() {
++	if (dl_iterate_phdr(CheckResidentJudyUpdater, nullptr) != 0)
++		return nullptr;
++	void* updater = OpenJudyLibrary(kJudyUpdater);
++	if (!updater)
++		return nullptr;
++	if (!SymbolIsFrom(dlsym(updater, "gpt_utils_get_partition_map"), kJudyUpdater)) {
++		LOGERR("Judy bootctrl: dependency symbol did not resolve to %s\n", kJudyUpdater);
++		dlclose(updater);
++		return nullptr;
++	}
++	void* handle = OpenJudyLibrary(kJudyBootControl);
++	if (!handle) {
++		dlclose(updater);
++		return nullptr;
++	}
++	void* hmi = dlsym(handle, HAL_MODULE_INFO_SYM_AS_STR);
++	if (!SymbolIsFrom(hmi, kJudyBootControl)) {
++		LOGERR("Judy bootctrl: missing HMI from %s\n", kJudyBootControl);
++	} else {
++		auto* module = static_cast<boot_control_module_t*>(hmi);
++		if (module->common.tag != HARDWARE_MODULE_TAG || !module->common.id ||
++				strcmp(module->common.id, BOOT_CONTROL_HARDWARE_MODULE_ID) != 0) {
++			LOGERR("Judy bootctrl: invalid HMI tag or module ID in %s\n", kJudyBootControl);
++		} else if (!module->init || !module->getNumberSlots || !module->getCurrentSlot ||
++				!module->getSuffix || !module->setActiveBootSlot) {
++			LOGERR("Judy bootctrl: missing required HAL callbacks in %s\n", kJudyBootControl);
++		} else {
++			module->common.dso = handle;
++			module->init(module); // Legacy HAL init is void and must run only once.
++			return module; // Keep both recovery-local libraries loaded for this process.
++		}
++	}
++	dlclose(handle);
++	dlclose(updater);
++	return nullptr;
++}
++
++boot_control_module_t* CheckedJudyBootControl() {
++	static boot_control_module_t* module = LoadJudyBootControl();
++	if (!module) {
++		LOGERR("Judy bootctrl: unavailable (module=%s dependency=%s; no fallback)\n",
++			kJudyBootControl, kJudyUpdater);
++		return nullptr;
++	}
++	const string boot_suffix = android::base::GetProperty("ro.boot.slot_suffix", "");
++	const unsigned count = module->getNumberSlots(module);
++	const unsigned current = module->getCurrentSlot(module);
++	const char* suffix_a = count == 2 ? module->getSuffix(module, 0) : nullptr;
++	const char* suffix_b = count == 2 ? module->getSuffix(module, 1) : nullptr;
++	const char* current_suffix = current == 0 ? suffix_a : current == 1 ? suffix_b : nullptr;
++	LOGINFO("Judy bootctrl: module=%s dependency=%s count=%u current=%u suffix=%s ro.boot.slot_suffix=%s\n",
++		kJudyBootControl, kJudyUpdater, count, current, current_suffix ? current_suffix : "(invalid)",
++		boot_suffix.empty() ? "(missing)" : boot_suffix.c_str());
++	if (count != 2 || current >= count || !suffix_a || strcmp(suffix_a, "_a") != 0 ||
++			!suffix_b || strcmp(suffix_b, "_b") != 0 || !current_suffix || boot_suffix != current_suffix) {
++		LOGERR("Judy bootctrl: slot count, suffix mapping, or booted slot validation failed\n");
++		return nullptr;
++	}
++	return module;
++}
++
++bool ReadSlotMounts(std::vector<string>& mounts) {
++	FILE* fp = setmntent("/proc/self/mounts", "re");
++	if (!fp) {
++		LOGERR("Slot preflight: cannot open mount table: %s\n", strerror(errno));
++		return false;
++	}
++	for (mntent* entry; (entry = getmntent(fp)) != nullptr;)
++		mounts.emplace_back(entry->mnt_dir);
++	const bool ok = feof(fp) && !ferror(fp) && !mounts.empty();
++	endmntent(fp);
++	if (!ok)
++		LOGERR("Slot preflight: cannot read complete mount table\n");
++	return ok;
++}
++} // namespace
++#endif
++
+ TWPartitionManager::TWPartitionManager(void) {
+ 	mtp_was_enabled = false;
+ 	mtp_write_fd = -1;
+ 	uevent_pfd.fd = -1;
+ 	stop_backup.set_value(0);
+ #ifdef AB_OTA_UPDATER
+-	char slot_suffix[PROPERTY_VALUE_MAX];
+-	property_get("ro.boot.slot_suffix", slot_suffix, "error");
+-	if (strcmp(slot_suffix, "error") == 0)
+-		property_get("ro.boot.slot", slot_suffix, "error");
+-	Active_Slot_Display = "";
+-	if (strcmp(slot_suffix, "_a") == 0 || strcmp(slot_suffix, "a") == 0)
+-		Set_Active_Slot("A");
+-	else
+-		Set_Active_Slot("B");
++	string suffix = android::base::GetProperty("ro.boot.slot_suffix", "");
++	if (strcmp(FOX_DEVICE, "judyln") != 0 && suffix.empty())
++		suffix = android::base::GetProperty("ro.boot.slot", "");
++	if (suffix == "_a" || (suffix == "a" && strcmp(FOX_DEVICE, "judyln") != 0))
++		Active_Slot_Display = "A";
++	else if (suffix == "_b" || (suffix == "b" && strcmp(FOX_DEVICE, "judyln") != 0))
++		Active_Slot_Display = "B";
+ #endif
+ }
+ 
+@@ -1675,7 +1800,7 @@ int TWPartitionManager::Wipe_Media_From_Data(void) {
+ 	return false;
+ }
+ 
+-int TWPartitionManager::Repair_By_Path(string Path, bool Display_Error) {
++int TWPartitionManager::Repair_By_Path(string Path, bool Display_Error, const string& suffix) {
+ 	std::vector<TWPartition*>::iterator iter;
+ 	int ret = false;
+ 	bool found = false;
+@@ -1687,10 +1812,10 @@ int TWPartitionManager::Repair_By_Path(string Path, bool Display_Error) {
+ 	// Iterate through all partitions
+ 	for (iter = Partitions.begin(); iter != Partitions.end(); iter++) {
+ 		if ((*iter)->Mount_Point == Local_Path || (!(*iter)->Symlink_Mount_Point.empty() && (*iter)->Symlink_Mount_Point == Local_Path)) {
+-			ret = (*iter)->Repair();
++			ret = (*iter)->Repair(suffix);
+ 			found = true;
+ 		} else if ((*iter)->Is_SubPartition && (*iter)->SubPartition_Of == Local_Path) {
+-			(*iter)->Repair();
++			(*iter)->Repair(suffix);
+ 		}
+ 	}
+ 	if (found) {
+@@ -1703,7 +1828,7 @@ int TWPartitionManager::Repair_By_Path(string Path, bool Display_Error) {
+ 	return false;
+ }
+ 
+-int TWPartitionManager::Resize_By_Path(string Path, bool Display_Error) {
++int TWPartitionManager::Resize_By_Path(string Path, bool Display_Error, const string& suffix) {
+ 	std::vector<TWPartition*>::iterator iter;
+ 	int ret = false;
+ 	bool found = false;
+@@ -1715,10 +1840,10 @@ int TWPartitionManager::Resize_By_Path(string Path, bool Display_Error) {
+ 	// Iterate through all partitions
+ 	for (iter = Partitions.begin(); iter != Partitions.end(); iter++) {
+ 		if ((*iter)->Mount_Point == Local_Path || (!(*iter)->Symlink_Mount_Point.empty() && (*iter)->Symlink_Mount_Point == Local_Path)) {
+-			ret = (*iter)->Resize();
++			ret = (*iter)->Resize(suffix);
+ 			found = true;
+ 		} else if ((*iter)->Is_SubPartition && (*iter)->SubPartition_Of == Local_Path) {
+-			(*iter)->Resize();
++			(*iter)->Resize(suffix);
+ 		}
+ 	}
+ 	if (found) {
+@@ -2521,7 +2646,10 @@ void TWPartitionManager::Get_Partition_List(string ListType,
+     {
+       for (iter = Partitions.begin(); iter != Partitions.end(); iter++)
+ 	{
+-	  if ((*iter)->Wipe_Available_in_GUI && !(*iter)->Is_SubPartition)
++	  if (!(*iter)->Is_SubPartition &&
++	      ((*iter)->Wipe_Available_in_GUI ||
++	       ((*iter)->Management_Available_in_GUI && ((*iter)->Can_Be_Mounted ||
++	        (*iter)->Uses_Ext4_Maintenance()))))
+ 	    {
+ 	      struct PartitionList part;
+ 	      part.Display_Name = (*iter)->Display_Name;
+@@ -3343,39 +3471,143 @@ void TWPartitionManager::Remove_Partition_By_Path(string Path) {
+ 	}
+ }
+ 
+-void TWPartitionManager::Set_Active_Slot(const string& Slot) {
++bool TWPartitionManager::Probe_Boot_Control() {
++#ifdef AB_OTA_UPDATER
++	if (strcmp(FOX_DEVICE, "judyln") == 0)
++		return CheckedJudyBootControl() != nullptr;
++#endif
++	LOGERR("Read-only Judy bootctrl probe is not available on this device\n");
++	return false;
++}
++
++bool TWPartitionManager::Set_Active_Slot(const string& Slot) {
+ 	if (Slot != "A" && Slot != "B") {
+-		LOGERR("Set_Active_Slot invalid slot '%s'\n", Slot.c_str());
+-		return;
++		LOGERR("Set_Active_Slot: invalid slot '%s' (expected A or B)\n", Slot.c_str());
++		return false;
+ 	}
+-	if (Active_Slot_Display == Slot)
+-		return;
+-	LOGINFO("Setting active slot %s\n", Slot.c_str());
+-#ifdef AB_OTA_UPDATER
+-	if (!Active_Slot_Display.empty()) {
+-		const hw_module_t *hw_module;
+-		boot_control_module_t *module;
+-		int ret;
+-		ret = hw_get_module("bootctrl", &hw_module);
+-		if (ret != 0) {
+-			LOGERR("Error getting bootctrl module.\n");
+-		} else {
+-			module = (boot_control_module_t*) hw_module;
++#ifndef AB_OTA_UPDATER
++	LOGERR("Boot slot feature not present\n");
++	return false;
++#else
++	static std::mutex transaction_lock;
++	static bool next_slot_unknown = false;
++	const std::lock_guard<std::mutex> lock(transaction_lock);
++	if (next_slot_unknown) {
++		LOGERR("Bootctrl: next boot slot is unknown after a HAL error; slot changes blocked until reboot\n");
++		return false;
++	}
++	const bool judy = strcmp(FOX_DEVICE, "judyln") == 0;
++	if (!judy && Active_Slot_Display == Slot)
++		return true;
++	if (!Fstab_Processed() || Active_Slot_Display.empty()) {
++		LOGERR("Set_Active_Slot: recovery fstab or booted slot is unavailable\n");
++		return false;
++	}
++	const unsigned slot_number = Slot == "A" ? 0 : 1;
++	const string target_suffix = slot_number == 0 ? "_a" : "_b";
++	boot_control_module_t* module = nullptr;
++	if (judy) {
++		module = CheckedJudyBootControl();
++		if (!module)
++			return false;
++		// Boot, system and vendor must be usable on the target. Optional fstab
++		// entries may be absent and will stay unavailable when selected.
++		for (const string& path : {string("/boot"), Get_Android_Root_Path(), string("/vendor")}) {
++			TWPartition* part = Find_Partition_By_Path(path);
++			if (!part || !part->SlotSelect || part->Get_Judy_Slot_Block_Device(target_suffix).empty()) {
++				LOGERR("Judy slot preflight: no valid %s target for %s\n", target_suffix.c_str(), path.c_str());
++				return false;
++			}
++		}
++	} else {
++		const hw_module_t* hw_module = nullptr;
++		const int rc = hw_get_module(BOOT_CONTROL_HARDWARE_MODULE_ID, &hw_module);
++		if (rc != 0 || !hw_module || hw_module->tag != HARDWARE_MODULE_TAG || !hw_module->id ||
++				strcmp(hw_module->id, BOOT_CONTROL_HARDWARE_MODULE_ID) != 0) {
++			LOGERR("Bootctrl: unable to load a valid standard HAL (rc=%d)\n", rc);
++			return false;
++		}
++		module = reinterpret_cast<boot_control_module_t*>(const_cast<hw_module_t*>(hw_module));
++		if (!module->init || !module->setActiveBootSlot) {
++			LOGERR("Bootctrl: missing required standard HAL callbacks\n");
++			return false;
++		}
++		static boot_control_module_t* initialized = nullptr;
++		if (initialized != module) {
+ 			module->init(module);
+-			int slot_number = 0;
+-			if (Slot == "B")
+-				slot_number = 1;
+-			if (module->setActiveBootSlot(module, slot_number))
+-				gui_msg(Msg(msg::kError, "unable_set_boot_slot=Error changing bootloader boot slot to {1}")(Slot));
++			initialized = module;
+ 		}
+-		DataManager::SetValue("tw_active_slot", Slot); // Doing this outside of this if block may result in a seg fault because the DataManager may not be ready yet
+ 	}
+-#else
+-	LOGERR("Boot slot feature not present\n");
+-#endif
++
++	// Use the mount table, not the st_dev heuristic (which can miss bind
++	// mounts). Plan all normal unmounts before attempting any of them.
++	std::vector<string> mounts;
++	if (!ReadSlotMounts(mounts))
++		return false;
++	const auto mounted = [](const std::vector<string>& table, const string& path) {
++		return std::find(table.begin(), table.end(), path) != table.end();
++	};
++	std::vector<string> unmount_paths;
++	std::vector<unsigned> mtp_storage_ids;
++	for (TWPartition* part : Partitions) {
++		if (!part->SlotSelect || !part->Is_File_System(part->Fstab_File_System))
++			continue;
++		if (mounted(mounts, part->Mount_Point)) {
++			if (part->Mount_Point == Get_Android_Root_Path() && DataManager::GetIntValue(TW_DONT_UNMOUNT_SYSTEM) == 1) {
++				LOGERR("Slot preflight: %s is mounted and recovery is configured not to unmount it\n", part->Mount_Point.c_str());
++				return false;
++			}
++			if (part->Is_Storage && part->MTP_Storage_ID > 0)
++				mtp_storage_ids.push_back(part->MTP_Storage_ID);
++			unmount_paths.push_back(part->Mount_Point);
++		}
++		if (!part->Symlink_Mount_Point.empty() && mounted(mounts, part->Symlink_Mount_Point))
++			unmount_paths.push_back(part->Symlink_Mount_Point);
++	}
++	// Descendants before parents; a busy or otherwise unsafe mount aborts.
++	std::sort(unmount_paths.begin(), unmount_paths.end(), [](const string& a, const string& b) {
++		return a.size() != b.size() ? a.size() > b.size() : a < b;
++	});
++	unmount_paths.erase(std::unique(unmount_paths.begin(), unmount_paths.end()), unmount_paths.end());
++	for (unsigned id : mtp_storage_ids)
++		Remove_MTP_Storage(id);
++	for (const string& path : unmount_paths) {
++		if (umount(path.c_str()) != 0) {
++			LOGERR("Slot preflight: cannot unmount %s: %s; no HAL setter called\n", path.c_str(), strerror(errno));
++			return false;
++		}
++	}
++	mounts.clear();
++	if (!ReadSlotMounts(mounts))
++		return false;
++	for (TWPartition* part : Partitions) {
++		if (part->SlotSelect && part->Is_File_System(part->Fstab_File_System) &&
++				(mounted(mounts, part->Mount_Point) || mounted(mounts, part->Symlink_Mount_Point))) {
++			LOGERR("Slot preflight: %s or its bind mount is still mounted; no HAL setter called\n", part->Mount_Point.c_str());
++			return false;
++		}
++	}
++
++	LOGINFO("Bootctrl: requesting next boot slot %s (recovery selected %s)\n", Slot.c_str(), Active_Slot_Display.c_str());
++	const int rc = module->setActiveBootSlot(module, slot_number);
++	if (rc != 0) {
++		next_slot_unknown = true;
++		LOGERR("Bootctrl: setActiveBootSlot(%u) failed (%d); next boot slot is unknown; slot changes blocked until reboot\n", slot_number, rc);
++		gui_err("boot_slot_unknown=Next boot slot is unknown. No further slot changes are allowed until reboot.");
++		return false;
++	}
++	// No persistent-next-slot getter is exposed by this HAL. getCurrentSlot
++	// reports the running boot, not the just-requested next boot slot.
+ 	Active_Slot_Display = Slot;
+-	if (Fstab_Processed())
+-		Update_System_Details();
++	for (TWPartition* part : Partitions) {
++		if (part->SlotSelect)
++			part->Find_Actual_Block_Device();
++	}
++	DataManager::SetValue("tw_active_slot", Slot);
++	Update_System_Details();
++	LOGINFO("Bootctrl: HAL accepted next boot slot %s\n", Slot.c_str());
++	return true;
++#endif
+ }
+ 
+ string TWPartitionManager::Get_Internal_Storage_Path() {
+@@ -3388,7 +3620,9 @@ string TWPartitionManager::Get_Internal_Storage_Path() {
+ string TWPartitionManager::Get_Active_Slot_Suffix() {
+ 	if (Active_Slot_Display == "A")
+ 		return "_a";
+-	return "_b";
++	if (Active_Slot_Display == "B")
++		return "_b";
++	return "";
+ }
+ string TWPartitionManager::Get_Active_Slot_Display() {
+ 	return Active_Slot_Display;
+diff --git a/partitions.hpp b/partitions.hpp
+index 3661997..38e8fa4 100644
+--- a/partitions.hpp
++++ b/partitions.hpp
+@@ -142,11 +142,12 @@ public:
+ 	bool Wipe(string New_File_System);                                        // Wipes the partition
+ 	bool Wipe();                                                              // Wipes the partition
+ 	bool Wipe_AndSec();                                                       // Wipes android secure
++	bool Can_Format();                                                        // Checks whether formatting is permitted
+ 	bool Can_Repair();                                                        // Checks to see if we have everything needed to be able to repair the current file system
+ 	uint64_t Get_Max_FileSize();                                              // get partition maxFileSie
+-	bool Repair();                                                            // Repairs the current file system
++	bool Repair(const string& suffix = "");                                                            // Repairs the current file system
+ 	bool Can_Resize();                                                        // Checks to see if we have everything needed to be able to resize the current file system
+-	bool Resize();                                                            // Resizes the current file system
++	bool Resize(const string& suffix = "");                                                            // Resizes the current file system
+ 	bool Backup(PartitionSettings *part_settings, pid_t *tar_fork_pid);       // Backs up the partition to the folder specified
+ 	bool Restore(PartitionSettings *part_settings);                           // Restores the partition using the backup folder provided
+ 	unsigned long long Get_Restore_Size(PartitionSettings *part_settings);    // Returns the overall restore size of the backup
+@@ -198,6 +199,15 @@ private:
+ 	void Setup_Cache_Partition(bool Display_Error);                           // Setup cache partition after fstab processed
+ 	bool Find_Wildcard_Block_Devices(const string& Device);                   // Searches for and finds wildcard block devices
+ 	void Find_Actual_Block_Device();                                          // Determines the correct block device and stores it in Actual_Block_Device
++	string Get_Judy_Slot_Block_Device(const string& suffix) const;             // Returns only an exact, existing Judy GPT partition
++	bool Uses_Ext4_Maintenance() const;
++	struct MaintenanceTarget {
++		uint64_t device_bytes = 0, filesystem_bytes = 0, grow_blocks = 0, block_bytes = 0, writable_bytes = 0;
++		string filesystem, rw_block, repair_block, grow_block, metadata_snapshot;
++	};
++	bool Run_Ext4_Maintenance(bool grow, const string& suffix);
++	bool Has_Actual_Ext4();
++	string Inspect_Ext4_Target(int fd, const string& suffix, dev_t* dev, MaintenanceTarget* info);
+ 
+ 	void Apply_TW_Flag(const unsigned flag, const char* str, const bool val); // Apply custom twrp fstab flags
+ 	void Process_TW_Flags(char *flags, bool Display_Error, int fstab_ver);    // Process custom twrp fstab flags
+@@ -251,6 +261,7 @@ private:
+ 	bool Can_Be_Adv_Backed_Up; 
+ 	bool Use_Rm_Rf;                                                           // Indicates that the partition will always be formatted w/ "rm -rf *"
+ 	bool Wipe_During_Factory_Reset;                                           // Indicates that this partition is wiped during a factory reset
++	bool Management_Available_in_GUI;                                         // Opt-in visibility in partition management only
+ 	bool Wipe_Available_in_GUI;                                               // Inidcates that the wipe can be user initiated in the GUI system
+ 	bool Is_SubPartition;                                                     // Indicates that this partition is a sub-partition of another partition (e.g. datadata is a sub-partition of data)
+ 	bool Has_SubPartition;                                                    // Indicates that this partition has a sub-partition
+@@ -371,8 +382,8 @@ public:
+ 	int Wipe_Android_Secure();                                                // Wipes android secure
+ 	int Format_Data();                                                        // Really formats data on /data/media devices -- also removes encryption
+ 	int Wipe_Media_From_Data();                                               // Removes and recreates the media folder on /data/media devices
+-	int Repair_By_Path(string Path, bool Display_Error);                      // Repairs a partition based on path
+-	int Resize_By_Path(string Path, bool Display_Error);                      // Resizes a partition based on path
++	int Repair_By_Path(string Path, bool Display_Error, const string& suffix = "");                      // Repairs a partition based on path
++	int Resize_By_Path(string Path, bool Display_Error, const string& suffix = "");                      // Resizes a partition based on path
+ 	void Update_System_Details();                                             // Updates fstab, file systems, sizes, etc.
+ 	void Update_System_Details_OTA_Survival();                                             // Updates fstab, file systems, sizes, etc.
+ 	int Decrypt_Device(string Password, int user_id = 0);                     // Attempt to decrypt any encrypted partitions
+@@ -409,7 +420,8 @@ public:
+ 	
+ 	bool Restore_Partition(struct PartitionSettings *part_settings);          // Restore the partitions based on type
+ 	TWAtomicInt stop_backup;
+-	void Set_Active_Slot(const string& Slot);                                 // Sets the active slot to A or B
++	bool Set_Active_Slot(const string& Slot);                                 // Changes the next boot slot and updates recovery's selected slot on success
++	bool Probe_Boot_Control();                                                // Validates Judy's HAL and reports the booted slot without changing it
+ 	string Get_Active_Slot_Suffix();                                          // Returns active slot _a or _b
+ 	string Get_Active_Slot_Display();                                         // Returns active slot A or B for display purposes
+ 	string Get_Android_Root_Path();                                           // Returns path of ANDROID_ROOT environment variable
+diff --git a/tests/Android.bp b/tests/Android.bp
+index 09ef716..9402d1e 100644
+--- a/tests/Android.bp
++++ b/tests/Android.bp
+@@ -144,6 +144,8 @@ cc_test {
+ 
+ cc_test {
+     name: "recovery_component_test",
++    // These AOSP component tests require libraries replaced by TWRP/OrangeFox.
++    enabled: false,
+     isolated: true,
+ 
+     defaults: [
+@@ -163,10 +165,8 @@ cc_test {
+         "libprotobuf-cpp-lite",
+     ],
+ 
+-    data: [
+-        "testdata/*",
+-        ":res-testdata",
+-    ],
++    // AOSP-only resource fixture is not supplied by the Fox UI.
++    data: ["testdata/*"],
+ }
+ 
+ cc_test_host {
+diff --git a/twrp-functions.cpp b/twrp-functions.cpp
+index 87cea36..7763cc0 100755
+--- a/twrp-functions.cpp
++++ b/twrp-functions.cpp
+@@ -50,6 +50,11 @@
+ #include "twrp-functions.hpp"
+ #include "twcommon.h"
+ #include "gui/gui.hpp"
++#ifdef OF_JUDYLN_QPNP_TORCH
++#include "judy_torch.hpp"
++#include <android-base/file.h>
++#include <mutex>
++#endif
+ #ifndef BUILD_TWRPTAR_MAIN
+ #include "data.hpp"
+ #include "partitions.hpp"
+@@ -1051,9 +1056,86 @@ void TWFunc::Update_Intent_File(string Intent)
+     }
+ }
+ 
++#ifdef OF_JUDYLN_QPNP_TORCH
++namespace judy_torch {
++namespace {
++struct Sysfs {
++	bool isJudy() const { return android::base::GetProperty("ro.product.device", "") == "judyln"; }
++	std::string resolve(const std::string& path) const {
++		std::string value;
++		return android::base::Realpath(path, &value) ? value : "";
++	}
++	std::string text(const std::string& path) const {
++		std::string s;
++		if (!android::base::ReadFileToString(path, &s)) return {};
++		if (!s.empty() && s.back() == '\n') s.pop_back();
++		return s;
++	}
++	int number(const std::string& path) const {
++		const std::string s = text(path);
++		if (s.empty() || s.size() > 4 || s.find_first_not_of("0123456789") != std::string::npos) return -1;
++		return atoi(s.c_str());
++	}
++	int number(Node n, const char* attr) const { return number(canonical(n) + "/" + attr); }
++	std::string trigger(Node n) const { return selected(text(canonical(n) + "/trigger")); }
++	const char* onGuard() const {
++		if (android::base::GetProperty("ro.orangefox.boot", "") != "1") return "not in OrangeFox recovery";
++		for (const char* service : {"init.svc.cameraserver", "init.svc.vendor.camera-provider-2-4"}) {
++			const std::string state = android::base::GetProperty(service, "");
++			if (!state.empty() && state != "stopped") return "camera service is active";
++		}
++		const int capacity = number("/sys/class/power_supply/battery/capacity");
++		const int temp = number("/sys/class/power_supply/battery/temp"); // tenths of a degree Celsius
++		if (text("/sys/class/power_supply/battery/health") != "Good" ||
++		    capacity < 20 || capacity > 100 || temp < 50 || temp > 380)
++			return "battery health, charge or temperature is outside torch limits";
++		if (text("/sys/class/camera/flash_fault_status/fault_status") != "0")
++			return "flash fault or unavailable fault status";
++		return nullptr;
++	}
++	Write write(Node n, int value) const {
++		// Only these three brightness attributes can be written. The driver
++		// substitutes a nonzero debug override even for a zero request.
++		if (n == Torch0 || n == Torch1) {
++			if ((value != TorchCurrent && value != 0) ||
++			    number(std::string("/sys/class/camera/") + led(n).name + "/flash_brightness") != 0)
++				return Write::NotIssued;
++		} else if (n != Gate || (value != 1 && value != 0)) {
++			return Write::NotIssued;
++		}
++		int fd = open((canonical(n) + "/brightness").c_str(), O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
++		if (fd < 0) return Write::NotIssued;
++		const char* cmd = value == TorchCurrent ? "100" : (value == 1 ? "1" : "0");
++		const ssize_t len = value == TorchCurrent ? 3 : 1;
++		const bool ok = ::write(fd, cmd, len) == len;
++		return close(fd) == 0 && ok ? Write::Complete : Write::Uncertain;
++	}
++};
++std::mutex torchLock;
++Controller controller;
++Sysfs sysfs;
++} // namespace
++
++Result toggle(bool simulate) {
++	std::lock_guard<std::mutex> lock(torchLock);
++	struct timespec t;
++	int64_t ms = clock_gettime(CLOCK_MONOTONIC, &t) == 0 ? int64_t(t.tv_sec) * 1000 + t.tv_nsec / 1000000 : -1;
++	return controller.toggle(sysfs, simulate, ms);
++}
++Result shutdown() {
++	std::lock_guard<std::mutex> lock(torchLock);
++	return controller.shutdown(sysfs);
++}
++} // namespace judy_torch
++#endif
++
+ // reboot: Reboot the system. Return -1 on error, no return on success
+ int TWFunc::tw_reboot(RebootCommand command)
+ {
++#ifdef OF_JUDYLN_QPNP_TORCH
++	const judy_torch::Result torch = judy_torch::shutdown();
++	if (torch.error) LOGERR("Flashlight cleanup: %s\n", torch.error);
++#endif
+ 	DataManager::Flush();
+ 	Update_Log_File();
+ 
+@@ -2342,7 +2424,11 @@ void TWFunc::Welcome_Message(void)
+     gui_print("--------------------------\n");
+     gui_print_color("green", "Welcome to OrangeFox Recovery!\n");
+     gui_print("[Platform]  : %s\n", DataManager::GetStrValue(FOX_COMPATIBILITY_DEVICE).c_str());
+-    gui_print("[Release]   : %s\n", FOX_BUILD);
++    const string local_build = DataManager::GetStrValue("fox_local_build");
++    if (local_build.empty())
++      gui_print("[Release]   : %s\n", FOX_BUILD);
++    else
++      gui_print("[Release]   : %s-%s\n", FOX_MAIN_VERSION_STR, local_build.c_str());
+     gui_print("[Variant]   : %s\n", FOX_VARIANT);
+     gui_print("[Codebase]  : %s, %s\n", Fox_Property_Get("ro.build.version.sdk").c_str(), FOX_CURRENT_DEV_STR);
+     gui_print("[Build date]: %s\n", DataManager::GetStrValue("FOX_BUILD_DATE_REAL").c_str());
+diff --git a/twrpRepacker.cpp b/twrpRepacker.cpp
+index 3ba239f..1e98cf7 100755
+--- a/twrpRepacker.cpp
++++ b/twrpRepacker.cpp
+@@ -198,10 +198,9 @@ bool twrpRepacker::Repack_Image_And_Flash(const std::string& Target_Image, const
+ 	if (part->Is_SlotSelect() && Repack_Options.Type == REPLACE_RAMDISK) {
+ 		LOGINFO("Switching slots to flash ramdisk to both partitions\n");
+ 		string Current_Slot = PartitionManager.Get_Active_Slot_Display();
+-		if (Current_Slot == "A")
+-			PartitionManager.Set_Active_Slot("B");
+-		else
+-			PartitionManager.Set_Active_Slot("A");
++		if ((Current_Slot != "A" && Current_Slot != "B") ||
++				!PartitionManager.Set_Active_Slot(Current_Slot == "A" ? "B" : "A"))
++			return false;
+ 		DataManager::SetProgress(.25);
+ 		if (!Backup_Image_For_Repack(part, REPACK_ORIG_DIR, Repack_Options.Backup_First, gui_lookup("repack", "Repack")))
+ 			return false;
+@@ -240,7 +239,8 @@ bool twrpRepacker::Repack_Image_And_Flash(const std::string& Target_Image, const
+ 		}
+ 		DataManager::SetProgress(1);
+ 		TWFunc::removeDir(REPACK_ORIG_DIR, false);
+-		PartitionManager.Set_Active_Slot(Current_Slot);
++		if (!PartitionManager.Set_Active_Slot(Current_Slot))
++			return false;
+ 	}
+ 	TWFunc::removeDir(REPACK_NEW_DIR, false);
+ 	return true;
+diff --git a/ext4_maintenance.hpp b/ext4_maintenance.hpp
+new file mode 100644
+index 0000000..cbd4bbf
+--- /dev/null
++++ b/ext4_maintenance.hpp
+@@ -0,0 +1,237 @@
++#ifndef FOX_EXT4_MAINTENANCE_HPP
++#define FOX_EXT4_MAINTENANCE_HPP
++
++#include <cstdint>
++#include <cstring>
++#include <istream>
++#include <sstream>
++#include <string>
++#include <sys/wait.h>
++#include <algorithm>
++#include <vector>
++#include <libavb/libavb.h>
++
++namespace ext4_maintenance {
++
++// Bounds are safety limits, not a boot trust decision. Even a valid signature
++// here only proves consistency with the embedded key; unsigned metadata is allowed.
++inline bool Interval(uint64_t offset, uint64_t size, uint64_t end) {
++	return offset <= end && size <= end - offset;
++}
++
++inline bool GptName(const std::string& name) {
++	return !name.empty() && name.size() <= 72 &&
++	       name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") == std::string::npos;
++}
++
++inline bool DescriptorMatches(const std::string& name, uint32_t flags,
++                              const std::string& suffix, const std::string& target) {
++	return GptName(name) && (flags & 1 ? name : name + suffix) == target;
++}
++
++struct AvbBounds {
++	std::string target, suffix, error;
++	uint64_t physical, ceiling;
++	bool matched = false;
++	bool disabled_flags_layout = false;
++	bool Reject(const char* reason) { error = reason; return false; }
++	bool Limit(uint64_t bytes) {
++		if (!bytes || bytes > physical) return Reject("AVB image size outside physical partition");
++		ceiling = std::min(ceiling, bytes);
++		matched = true;
++		return true;
++	}
++};
++
++inline bool BoundDescriptor(const AvbDescriptor* raw, void* opaque) {
++	auto& b = *static_cast<AvbBounds*>(opaque);
++	AvbDescriptor d;
++	if (!avb_descriptor_validate_and_byteswap(raw, &d)) return b.Reject("Malformed AVB descriptor");
++	const auto* bytes = reinterpret_cast<const uint8_t*>(raw);
++	const uint64_t total = sizeof(d) + d.num_bytes_following;
++	if (d.tag == AVB_DESCRIPTOR_TAG_CHAIN_PARTITION)
++		return b.Reject("Unresolved AVB chain: growth requires complete metadata");
++	if (d.tag == AVB_DESCRIPTOR_TAG_HASHTREE) {
++		AvbHashtreeDescriptor h;
++		if (total < sizeof(h) || !avb_hashtree_descriptor_validate_and_byteswap(
++		    reinterpret_cast<const AvbHashtreeDescriptor*>(raw), &h) ||
++		    !Interval(sizeof(h), uint64_t(h.partition_name_len) + h.salt_len + h.root_digest_len, total))
++			return b.Reject("Malformed AVB hashtree descriptor");
++		const std::string name(reinterpret_cast<const char*>(bytes + sizeof(h)), h.partition_name_len);
++		if (!GptName(name) || (h.flags & ~uint32_t(1))) return b.Reject("Unsupported AVB hashtree name or flags");
++		if (!DescriptorMatches(name, h.flags, b.suffix, b.target)) return true;
++		if (!b.Limit(h.image_size)) return false;
++		if (!Interval(h.tree_offset, h.tree_size, b.physical) ||
++		    (h.tree_size && h.tree_offset < h.image_size) ||
++		    !Interval(h.fec_offset, h.fec_size, b.physical) ||
++		    (h.fec_size && (h.fec_offset < h.image_size ||
++		     (h.tree_size && h.fec_offset < h.tree_offset + h.tree_size))))
++			return b.Reject("AVB tree/FEC intervals outside partition or overlapping payload");
++		if (h.tree_size) b.ceiling = std::min(b.ceiling, h.tree_offset);
++		if (h.fec_size) b.ceiling = std::min(b.ceiling, h.fec_offset);
++	} else if (d.tag == AVB_DESCRIPTOR_TAG_HASH) {
++		AvbHashDescriptor h;
++		if (total < sizeof(h) || !avb_hash_descriptor_validate_and_byteswap(
++		    reinterpret_cast<const AvbHashDescriptor*>(raw), &h) ||
++		    !Interval(sizeof(h), uint64_t(h.partition_name_len) + h.salt_len + h.digest_len, total))
++			return b.Reject("Malformed AVB hash descriptor");
++		const std::string name(reinterpret_cast<const char*>(bytes + sizeof(h)), h.partition_name_len);
++		if (!GptName(name) || (h.flags & ~uint32_t(1))) return b.Reject("Unsupported AVB hash name or flags");
++		if (DescriptorMatches(name, h.flags, b.suffix, b.target)) return b.Limit(h.image_size);
++	} else if (d.tag != AVB_DESCRIPTOR_TAG_PROPERTY && d.tag != AVB_DESCRIPTOR_TAG_KERNEL_CMDLINE) {
++		return b.Reject("Unknown AVB descriptor: incomplete growth evidence");
++	}
++	return true;
++}
++
++inline bool ReadAvbBounds(const std::vector<uint8_t>& image, AvbBounds* bounds) {
++	auto result = avb_vbmeta_image_verify(image.data(), image.size(), nullptr, nullptr);
++	// avbctl/fastboot disabling verification commonly changes only flags, leaving
++	// the old signature. Recover layout evidence in a PRIVATE COPY, never boot
++	// authorization: only exact flags=3 -> 0 is allowed, and all remaining signed
++	// bytes must still verify. Snapshots always cover the original device bytes.
++	if (result == AVB_VBMETA_VERIFY_RESULT_HASH_MISMATCH && image.size() >= sizeof(AvbVBMetaImageHeader)) {
++		AvbVBMetaImageHeader original;
++		avb_vbmeta_image_header_to_host_byte_order(reinterpret_cast<const AvbVBMetaImageHeader*>(image.data()), &original);
++		if (original.flags == 3) {
++			auto copy = image;
++			reinterpret_cast<AvbVBMetaImageHeader*>(copy.data())->flags = 0;
++			result = avb_vbmeta_image_verify(copy.data(), copy.size(), nullptr, nullptr);
++			if (result == AVB_VBMETA_VERIFY_RESULT_OK) bounds->disabled_flags_layout = true;
++		}
++	}
++	if (result != AVB_VBMETA_VERIFY_RESULT_OK && result != AVB_VBMETA_VERIFY_RESULT_OK_NOT_SIGNED)
++		return bounds->Reject("Invalid AVB metadata structure or signature");
++	AvbVBMetaImageHeader h;
++	avb_vbmeta_image_header_to_host_byte_order(reinterpret_cast<const AvbVBMetaImageHeader*>(image.data()), &h);
++	// libavb's unsigned fast path does not validate this auxiliary interval.
++	if (!Interval(h.descriptors_offset, h.descriptors_size, h.auxiliary_data_block_size))
++		return bounds->Reject("AVB descriptors outside auxiliary block");
++	if (!avb_descriptor_foreach(image.data(), image.size(), BoundDescriptor, bounds)) {
++		if (bounds->error.empty()) bounds->error = "Malformed AVB descriptor list";
++		return false;
++	}
++	return true;
++}
++
++inline uint32_t Le32(const unsigned char* p) {
++	return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
++}
++
++struct Geometry {
++	uint64_t blocks;
++	uint64_t block_bytes;
++	uint32_t first_data_block;
++	uint32_t blocks_per_group;
++	uint32_t inodes_per_group;
++	uint32_t inode_bytes;
++	uint32_t descriptor_bytes;
++	uint32_t reserved_gdt_blocks;
++	bool wide;
++};
++
++inline bool HasExternalJournal(const unsigned char (&sb)[1024]) {
++	if ((Le32(sb + 0x60) & 0x8) || Le32(sb + 0xe4)) return true;
++	for (size_t i = 0xd0; i < 0xe0; ++i)
++		if (sb[i]) return true;
++	return false;
++}
++
++inline Geometry ReadGeometry(const unsigned char (&sb)[1024]) {
++	if (sb[0x38] != 0x53 || sb[0x39] != 0xef) return {};
++	const auto shift = Le32(sb + 0x18);
++	if (shift > 6) return {};
++	const bool wide = (Le32(sb + 0x60) & 0x80) != 0;
++	uint64_t blocks = Le32(sb + 4);
++	if (wide) blocks |= uint64_t(Le32(sb + 0x150)) << 32;
++	return {blocks, uint64_t(1024) << shift, Le32(sb + 0x14), Le32(sb + 0x20),
++	        Le32(sb + 0x28), Le32(sb + 0x58) & 0xffff, wide ? Le32(sb + 0xfe) & 0xffff : 32,
++	        Le32(sb + 0xce) & 0xffff, wide};
++}
++
++inline bool Fits(const Geometry& fs, uint64_t ceiling) {
++	return fs.blocks && fs.block_bytes && fs.blocks <= ceiling / fs.block_bytes;
++}
++
++inline uint64_t FilesystemBytes(const std::string& type, const unsigned char (&sb)[1024], uint64_t device_bytes) {
++	if (type == "ext4" || type == "ext3" || type == "ext2") {
++		const auto fs = ReadGeometry(sb);
++		return Fits(fs, device_bytes) ? fs.blocks * fs.block_bytes : 0;
++	}
++	// Legacy EROFS on Judy: little-endian 32-bit block count and block size log2.
++	if (type == "erofs" && Le32(sb) == 0xe0f5e1e2 && sb[12] >= 9 && sb[12] <= 16 &&
++	    !(Le32(sb + 80) & 0x80)) {  // Do not interpret newer 48-bit geometry as legacy.
++		const uint64_t bytes = uint64_t(Le32(sb + 36)) << sb[12];
++		return bytes <= device_bytes ? bytes : 0;
++	}
++	return 0;
++}
++
++inline const char* Mount_Write_Block(const std::string& type, const unsigned char (&sb)[1024]) {
++	if (type == "erofs") return "EROFS is read-only";
++	if (type != "ext4") return "Fresh probe is not ext4";
++	if (Le32(sb + 0x64) & 0x4000) return "Ext4 has shared blocks";
++	return nullptr;
++}
++
++// Raw offline counters use f_bfree semantics: reserved blocks remain free,
++// not used (f_bavail would exclude them).
++inline bool ReadUsage(const unsigned char (&sb)[1024], uint64_t physical,
++                      uint64_t* size, uint64_t* used, uint64_t* free) {
++	const auto fs = ReadGeometry(sb);
++	if (!Fits(fs, physical)) return false;
++	uint64_t available = Le32(sb + 0xc), reserved = Le32(sb + 8);
++	if (fs.wide) {
++		available |= uint64_t(Le32(sb + 0x158)) << 32;
++		reserved |= uint64_t(Le32(sb + 0x154)) << 32;
++	}
++	if (available > fs.blocks || reserved > fs.blocks) return false;
++	*size = fs.blocks * fs.block_bytes;
++	*free = available * fs.block_bytes;
++	*used = *size - *free;
++	return true;
++}
++
++inline uint64_t GrowthCeiling(const Geometry& fs, uint64_t ceiling) {
++	if (!Fits(fs, ceiling) || fs.first_data_block > 1 || !fs.blocks_per_group || !fs.inodes_per_group ||
++	    fs.inode_bytes < 128 || fs.inode_bytes > fs.block_bytes || fs.descriptor_bytes < 32 ||
++	    fs.descriptor_bytes > fs.block_bytes) return 0;
++	uint64_t blocks = ceiling / fs.block_bytes;
++	if (!fs.wide && blocks > UINT32_MAX) blocks = UINT32_MAX;
++	if (blocks < fs.blocks || blocks <= fs.first_data_block) return 0;
++	const uint64_t span = blocks - fs.first_data_block;
++	const uint64_t partial = span % fs.blocks_per_group;
++	const uint64_t groups = span / fs.blocks_per_group + (partial != 0);
++	const uint64_t per_block = fs.block_bytes / fs.descriptor_bytes;
++	if (groups > UINT32_MAX) return 0;
++	// resize2fs can discard a short final block group. Use a conservative
++	// upper bound for its metadata overhead (including a possible backup SB).
++	const uint64_t overhead = 53 + fs.reserved_gdt_blocks + (groups + per_block - 1) / per_block +
++		(uint64_t(fs.inodes_per_group) * fs.inode_bytes + fs.block_bytes - 1) / fs.block_bytes;
++	if (partial && groups > 1 && partial < overhead) blocks -= partial;
++	return blocks;
++}
++
++inline uint64_t Growth(const Geometry& fs, uint64_t ceiling) {
++	const auto blocks = GrowthCeiling(fs, ceiling);
++	return blocks > fs.blocks ? blocks : 0;
++}
++
++inline bool Offline(std::istream& mountinfo, const std::string& device) {
++	std::string line, id, parent, dev, root, mountpoint;
++	bool seen = false;
++	while (std::getline(mountinfo, line)) {
++		std::istringstream record(line);
++		if (!(record >> id >> parent >> dev >> root >> mountpoint) || dev == device) return false;
++		seen = true;
++	}
++	return seen && mountinfo.eof() && !mountinfo.bad();
++}
++
++inline bool ToolSucceeded(int status, bool fsck) {
++	return status >= 0 && WIFEXITED(status) &&
++	       (WEXITSTATUS(status) == 0 || (fsck && WEXITSTATUS(status) == 1));
++}
++
++}  // namespace ext4_maintenance
++#endif
+diff --git a/image_validation.h b/image_validation.h
+new file mode 100644
+index 0000000..9bd150f
+--- /dev/null
++++ b/image_validation.h
+@@ -0,0 +1,143 @@
++/* Image-flash preflight. Metadata only: no image-sized allocations or writes. */
++#ifndef RECOVERY_IMAGE_VALIDATION_H
++#define RECOVERY_IMAGE_VALIDATION_H
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdint.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <limits>
++#include <string>
++
++namespace image_validation {
++inline uint16_t Le16(const unsigned char* p) {
++    return uint16_t(p[0]) | (uint16_t(p[1]) << 8);
++}
++inline uint32_t Le32(const unsigned char* p) {
++    return uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
++           (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
++}
++inline bool ReadAt(int fd, uint64_t file_size, uint64_t offset,
++                   unsigned char* data, size_t size) {
++    if (offset > file_size || size > file_size - offset ||
++        file_size > uint64_t(std::numeric_limits<off_t>::max()))
++        return false;
++    while (size) {
++        ssize_t n = pread(fd, data, size, static_cast<off_t>(offset));
++        if (n < 0 && errno == EINTR) continue;
++        if (n <= 0) return false;
++        offset += n;
++        data += n;
++        size -= n;
++    }
++    return true;
++}
++
++// CRC payload sizes are checked, not checksum values. simg2img remains the writer.
++inline bool ValidateFd(int fd, uint64_t target_size, uint64_t* image_size,
++                       bool* sparse) {
++    *image_size = 0;
++    *sparse = false;
++    struct stat st;
++    if (!target_size || fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0)
++        return false;
++    const uint64_t file_size = static_cast<uint64_t>(st.st_size);
++    unsigned char header[28];
++    if (file_size < 4) {
++        *image_size = file_size;
++        return file_size <= target_size;
++    }
++    if (!ReadAt(fd, file_size, 0, header, 4)) return false;
++    if (Le32(header) != 0xed26ff3a) {
++        *image_size = file_size;
++        return file_size <= target_size;
++    }
++    *sparse = true;
++    if (!ReadAt(fd, file_size, 0, header, sizeof(header))) return false;
++    const uint64_t file_header = Le16(header + 8);
++    const uint64_t chunk_header = Le16(header + 10);
++    const uint64_t block_size = Le32(header + 12);
++    const uint64_t total_blocks = Le32(header + 16);
++    const uint64_t chunks = Le32(header + 20);
++    if (Le16(header + 4) != 1 || file_header < 28 || file_header > file_size ||
++        chunk_header < 12 || !block_size || block_size % 4 ||
++        block_size > uint64_t(std::numeric_limits<int>::max()) || !total_blocks ||
++        !chunks || chunks > (file_size - file_header) / chunk_header)
++        return false;
++    // Both factors originate as uint32_t, so multiplication fits uint64_t.
++    const uint64_t expanded = total_blocks * block_size;
++    if (expanded > target_size || expanded > uint64_t(std::numeric_limits<off_t>::max()))
++        return false;
++    uint64_t offset = file_header, blocks = 0;
++    for (uint64_t i = 0; i < chunks; ++i) {
++        unsigned char chunk[12];
++        if (!ReadAt(fd, file_size, offset, chunk, sizeof(chunk))) return false;
++        const uint16_t type = Le16(chunk);
++        const uint64_t count = Le32(chunk + 4);
++        const uint64_t size = Le32(chunk + 8);
++        if (size < chunk_header || size > file_size - offset ||
++            count > total_blocks - blocks)
++            return false;
++        const uint64_t payload = size - chunk_header;
++        switch (type) {
++        case 0xcac1: // RAW
++            if (payload != count * block_size) return false;
++            break;
++        case 0xcac2: // FILL
++            if (payload != 4) return false;
++            break;
++        case 0xcac3: // DONT_CARE
++            if (payload != 0) return false;
++            break;
++        case 0xcac4: // CRC32 contributes no output blocks
++            if (count != 0 || payload != 4) return false;
++            break;
++        default:
++            return false;
++        }
++        blocks += count;
++        offset += size; // bounded by file_size above
++    }
++    if (blocks != total_blocks || offset != file_size) return false;
++    *image_size = expanded;
++    return true;
++}
++inline bool Validate(const std::string& path, uint64_t target_size,
++                     uint64_t* image_size, bool* sparse) {
++    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
++    if (fd < 0) return false;
++    bool valid = ValidateFd(fd, target_size, image_size, sparse);
++    close(fd);
++    return valid;
++}
++// Flash-only policy: never accept the resolver's unsuffixed/alternate fallback.
++// stat follows ordinary by-name symlinks, but the selected pathname must match.
++inline bool IsBlockDevice(const std::string& path) {
++    struct stat st;
++    return stat(path.c_str(), &st) == 0 && S_ISBLK(st.st_mode);
++}
++template <typename BlockDeviceCheck>
++inline bool ValidateFlashTarget(bool slot_select, const std::string& primary,
++                                const std::string& suffix, const std::string& actual,
++                                BlockDeviceCheck is_block_device) {
++    if (!slot_select) return true;
++    if (primary.empty() || (suffix != "_a" && suffix != "_b")) return false;
++    const std::string selected = primary + suffix;
++    return actual == selected && is_block_device(selected);
++}
++inline std::string ShellQuote(const std::string& path) {
++    std::string quoted("'");
++    for (size_t i = 0; i < path.size(); ++i) {
++        if (path[i] == '\'') quoted += "'\\''";
++        else quoted += path[i];
++    }
++    return quoted + "'";
++}
++template <typename Executor>
++inline bool ExecuteSparse(const std::string& source, const std::string& target,
++                          Executor execute) {
++    return execute("simg2img " + ShellQuote(source) + " " + ShellQuote(target)) == 0;
++}
++} // namespace image_validation
++#endif
+diff --git a/image_validation_test.cpp b/image_validation_test.cpp
+new file mode 100644
+index 0000000..08c2804
+--- /dev/null
++++ b/image_validation_test.cpp
+@@ -0,0 +1,109 @@
++// Host-only: c++ -std=c++11 -Wall -Wextra -Werror image_validation_test.cpp -o /tmp/image_validation_test
++#include "image_validation.h"
++#include <assert.h>
++#include <stdlib.h>
++#include <vector>
++#include <stdio.h>
++using namespace image_validation;
++using Bytes = std::vector<unsigned char>;
++static void put(Bytes& b, size_t at, uint32_t v, size_t n = 4) {
++    for (size_t i = 0; i < n; ++i) b.at(at + i) = (v >> (8 * i)) & 255;
++}
++static Bytes fixture(uint16_t type = 0xcac3, uint32_t count = 1, uint32_t payload = 0) {
++    Bytes b(40 + payload, 0);
++    put(b, 0, 0xed26ff3a); put(b, 4, 1, 2); put(b, 8, 28, 2);
++    put(b, 10, 12, 2); put(b, 12, 4096); put(b, 16, count); put(b, 20, 1);
++    put(b, 28, type, 2); put(b, 32, count); put(b, 36, 12 + payload);
++    return b;
++}
++static bool valid(const Bytes& b, uint64_t target = 4096) {
++    char name[] = "/tmp/image-validation-XXXXXX";
++    int fd = mkstemp(name); assert(fd >= 0); unlink(name);
++    if (!b.empty()) assert(write(fd, b.data(), b.size()) == static_cast<ssize_t>(b.size()));
++    uint64_t size; bool sparse;
++    bool result = ValidateFd(fd, target, &size, &sparse);
++    close(fd); return result;
++}
++int main() {
++    assert(!valid(Bytes())); assert(!valid(Bytes(512), 0));
++    assert(valid(Bytes(512), 512)); assert(!valid(Bytes(513), 512));
++    assert(valid(Bytes(1), 1)); assert(valid(fixture()));
++    assert(!valid(fixture(), 4095));
++    assert(valid(fixture(0xcac1, 1, 4096)));
++    assert(valid(fixture(0xcac2, 1, 4)));
++    assert(!valid(fixture(0xcac1, 1, 4)));
++    assert(!valid(fixture(0xcac2, 1, 0)));
++    assert(!valid(fixture(0xcac3, 1, 4)));
++    assert(!valid(fixture(0xcac4, 1, 4)));
++    assert(!valid(fixture(0xffff)));
++    Bytes b = fixture();
++    const size_t fields[] = {4, 8, 10, 12, 16, 20, 32, 36};
++    for (size_t at : fields) { Bytes bad = b; put(bad, at, 0, at < 12 ? 2 : 4); assert(!valid(bad)); }
++    for (size_t n = 4; n < b.size(); ++n) assert(!valid(Bytes(b.begin(), b.begin() + n)));
++    b.push_back(0); assert(!valid(b));
++    b = fixture(); put(b, 20, 0xffffffff); assert(!valid(b));
++    b = fixture(); put(b, 36, 0xffffffff); assert(!valid(b));
++    b = fixture(); put(b, 12, 4095); assert(!valid(b));
++    b = fixture(); put(b, 16, 2); assert(!valid(b));
++    b = fixture(); put(b, 32, 2); assert(!valid(b));
++    b = fixture(); put(b, 12, 0xfffffffc); put(b, 16, 0xffffffff);
++    assert(!valid(b, UINT64_MAX));
++    // A tiny compressed image must be judged by its 16 TiB expanded length.
++    b = fixture(0xcac3, 0xffffffff); assert(!valid(b));
++    assert(valid(b, uint64_t(4096) * 0xffffffff));
++    // Valid CRC metadata after a data chunk; CRC must have zero output blocks.
++    b = fixture(); b.resize(56); put(b, 20, 2); put(b, 40, 0xcac4, 2); put(b, 48, 16);
++    assert(valid(b)); put(b, 44, 1); assert(!valid(b));
++    // Extended headers are legal.
++    b = fixture(); b.insert(b.begin() + 28, 4, 0); put(b, 8, 32, 2);
++    b.insert(b.begin() + 44, 4, 0); put(b, 10, 16, 2); put(b, 40, 16);
++    assert(valid(b));
++    uint64_t size; bool sparse;
++    int fd = open("/tmp", O_RDONLY | O_DIRECTORY); assert(fd >= 0);
++    assert(!ValidateFd(fd, 4096, &size, &sparse)); close(fd);
++    assert(!Validate("/nonexistent/image-validation", 4096, &size, &sparse));
++    int calls = 0;
++    assert(!ExecuteSparse("/tmp/a'b;$(bad)", "/dev/a'b", [&](const std::string& command) {
++        ++calls;
++        assert(command == "simg2img '/tmp/a'\\''b;$(bad)' '/dev/a'\\''b'");
++        return 7;
++    }));
++    assert(ExecuteSparse("source", "target", [&](const std::string&) { ++calls; return 0; }));
++    assert(calls == 2);
++    // Mock dispatch behind the same production guard; no block nodes or writes.
++    int writes = 0, probes = 0, slot_cases = 0;
++    auto slot_case = [&](bool slotted, const std::string& primary,
++                         const std::string& suffix, const std::string& actual,
++                         bool selected_is_block, bool expected) {
++        int before = writes;
++        bool allowed = ValidateFlashTarget(slotted, primary, suffix, actual,
++            [&](const std::string& path) {
++                ++probes;
++                assert(path == primary + suffix);
++                return selected_is_block;
++            });
++        if (allowed) ++writes; // simulated backend dispatch only
++        assert(allowed == expected);
++        assert(writes - before == (expected ? 1 : 0));
++        ++slot_cases;
++    };
++    slot_case(true, "/dev/boot", "_a", "/dev/boot_a", true, true);
++    slot_case(true, "/dev/boot", "_b", "/dev/boot_b", true, true);
++    slot_case(true, "/dev/boot", "_b", "/dev/boot", false, false); // stale alias fallback
++    slot_case(true, "/dev/boot", "_b", "/dev/boot_b", false, false); // absent/nonblock
++    slot_case(true, "/dev/boot", "_b", "/dev/boot_a", true, false); // wrong slot
++    slot_case(true, "/dev/boot", "_b", "/dev/alternate", true, false);
++    slot_case(true, "/dev/boot", "", "/dev/boot", true, false);
++    slot_case(true, "/dev/boot", "a", "/dev/boota", true, false);
++    slot_case(true, "/dev/boot", "_c", "/dev/boot_c", true, false);
++    slot_case(true, "", "_a", "_a", true, false);
++    int before = probes;
++    slot_case(false, "/dev/recovery", "", "/dev/recovery", false, true);
++    assert(probes == before); // genuinely unslotted partitions retain existing policy
++    assert(!IsBlockDevice("/tmp"));
++    assert(!IsBlockDevice("/nonexistent/image-validation-block"));
++    char regular[] = "/tmp/image-target-XXXXXX";
++    fd = mkstemp(regular); assert(fd >= 0); close(fd);
++    assert(!IsBlockDevice(regular)); unlink(regular);
++    printf("image validation host fixtures passed; %d slot-policy cases passed (no block-device writes)\n", slot_cases);
++}
+diff --git a/judy_sparse_crc32.cpp b/judy_sparse_crc32.cpp
+new file mode 100644
+index 0000000..a3a3660
+--- /dev/null
++++ b/judy_sparse_crc32.cpp
+@@ -0,0 +1,11 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include <stddef.h>
++#include <stdint.h>
++#include <zlib.h>
++
++// The LG recovery updater expects this C symbol. Android Q's libsparse
++// exports a C++ symbol instead. Keep the bridge in judyln recovery only.
++extern "C" __attribute__((visibility("default")))
++uint32_t sparse_crc32(uint32_t crc, const void* data, size_t size) {
++	return size ? static_cast<uint32_t>(crc32_z(crc, static_cast<const Bytef*>(data), size)) : crc;
++}
+diff --git a/judy_torch.hpp b/judy_torch.hpp
+new file mode 100644
+index 0000000..94726a7
+--- /dev/null
++++ b/judy_torch.hpp
+@@ -0,0 +1,183 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++
++#include <stdint.h>
++#include <string>
++
++// Recovery only. QPNP brightness_get returns the LED class cache, not light or
++// PMIC feedback. No discovery, fallback, trigger writes or camera/debug controls.
++namespace judy_torch {
++
++enum Node { Torch0, Gate, Torch1, Flash0, Flash1, AuxGate };
++constexpr int TorchCurrent = 100;
++struct Led { const char* name; const char* trigger; int maximum; };
++inline const Led& led(Node n) {
++	static const Led nodes[] = {
++		{"led:torch_0", "torch0_trigger", 100}, {"led:switch_0", "switch0_trigger", 255},
++		{"led:torch_1", "torch1_trigger", 100}, {"led:flash_0", "flash0_trigger", 850},
++		{"led:flash_1", "flash1_trigger", 850}, {"led:switch_2", "none", 255},
++	};
++	return nodes[n];
++}
++inline std::string canonical(Node n) {
++	return std::string("/sys/devices/platform/soc/c440000.qcom,spmi/spmi-0/spmi0-03/"
++		"c440000.qcom,spmi:qcom,pmi8998@3:qcom,leds@d300/leds/") + led(n).name;
++}
++
++// Parse the *selected* trigger, not another name in the list of choices.
++inline std::string selected(const std::string& text) {
++	const size_t a = text.find('['), b = text.find(']');
++	if (a == std::string::npos || b == std::string::npos || b <= a + 1 ||
++	    (a && text[a - 1] != ' ') || (b + 1 < text.size() && text[b + 1] != ' ' && text[b + 1] != '\n') ||
++	    text.find_first_of("[]", b + 1) != std::string::npos || text.find('[', a + 1) != std::string::npos)
++		return {};
++	return text.substr(a + 1, b - a - 1);
++}
++
++enum class Write { NotIssued, Uncertain, Complete };
++struct Result {
++	const char* error;
++	int icon; // -1: leave unchanged; 0/1: requested state matches sysfs cache.
++};
++
++// The adapter holds one mutex across the whole action, including reboot cleanup.
++class Controller {
++	enum { DebounceMs = 250, Attempts = 3 };
++	enum class Match { Expected, Changed, Unreadable };
++	unsigned staged = 0, detached = 0; // bit per rear torch
++	bool gateRequested = false, blocked = false, closing = false;
++	int64_t lastTap = -1;
++
++	static unsigned bit(Node n) { return 1u << n; }
++	template<class IO> bool identity(IO& io, Node n) const {
++		const std::string link = std::string("/sys/class/leds/") + led(n).name;
++		return io.resolve(link) == canonical(n) &&
++		       io.resolve(link + "/device/driver") == "/sys/bus/platform/drivers/qcom,qpnp-flash-led-v2" &&
++		       io.number(n, "max_brightness") == led(n).maximum;
++	}
++	template<class IO> int gate(IO& io, Node n) const {
++		return identity(io, n) && io.trigger(n) == led(n).trigger ? io.number(n, "brightness") : -1;
++	}
++	template<class IO> Match configuration(IO& io) const {
++		// The cold DT caches are not armed channels. Leave both flash peers
++		// untouched, unlike Android's camera low path which sets them to zero.
++		for (Node n : {Torch0, Torch1, Flash0, Flash1, AuxGate}) {
++			if (!identity(io, n)) return Match::Unreadable;
++			const std::string trigger = io.trigger(n);
++			const int current = io.number(n, "brightness");
++			if (trigger.empty() || current < 0) return Match::Unreadable;
++			const bool ourDetached = detached & bit(n);
++			const int expected = n == AuxGate ? 0 :
++				(ourDetached && !(staged & bit(n)) ? 0 : led(n).maximum);
++			if (trigger != (ourDetached ? "none" : led(n).trigger) || current != expected)
++				return Match::Changed;
++		}
++		return Match::Expected;
++	}
++
++	template<class IO> Result release(IO& io) {
++		for (int attempt = 0; attempt < Attempts; ++attempt) {
++			if (!identity(io, Gate)) continue;
++			const std::string gateTrigger = io.trigger(Gate);
++			if (gateTrigger.empty()) continue;
++			if (gateTrigger != led(Gate).trigger) {
++				gateRequested = false;
++				blocked = true;
++				return {"shared gate trigger changed", -1};
++			}
++			const int currentGate = io.number(Gate, "brightness");
++			if (currentGate < 0) continue;
++			if (gateRequested || currentGate > 0) {
++				const Match match = gateRequested && currentGate <= 1 ?
++					configuration(io) : Match::Changed;
++				if (match == Match::Unreadable) continue;
++				if (match == Match::Changed) {
++					// Never reclaim a gate after a visible takeover, even if
++					// the same settings recur. Pending torch zeros can retry.
++					gateRequested = false;
++					blocked = true;
++					if (currentGate > 0) return {"shared gate is in use", -1};
++				} else {
++					// An ambiguous ON may have reached the driver, even with
++					// a zero cache. Request OFF, never pulse the gate open.
++					if (gate(io, Gate) != currentGate || io.write(Gate, 0) != Write::Complete ||
++					    io.number(Gate, "brightness") != 0) continue;
++					gateRequested = false;
++				}
++			}
++			for (Node n : {Torch0, Torch1}) {
++				if (!(staged & bit(n)) || !identity(io, n)) continue;
++				const std::string trigger = io.trigger(n);
++				const int current = io.number(n, "brightness");
++				if (trigger.empty() || current < 0) continue;
++				if (current != 0 || trigger != "none") {
++					// 100 is also the cold DT cache. A write that may have
++					// reached sysfs must be cleaned up even if it reads 100.
++					if (current != TorchCurrent || trigger != ((detached & bit(n)) ? "none" : led(n).trigger)) {
++						blocked = true;
++						continue;
++					}
++					if (gate(io, AuxGate) != 0 || gate(io, Gate) != 0 ||
++					    io.write(n, 0) != Write::Complete || io.number(n, "brightness") != 0 ||
++					    io.trigger(n) != "none") continue;
++				}
++				detached |= bit(n); // led-class detaches the torch trigger on zero
++				staged &= ~bit(n);
++			}
++			if (!staged) return {nullptr, 0};
++		}
++		// Leave pending cleanup eligible on the next tap or reboot.
++		return {"could not confirm torch cleanup", -1};
++	}
++
++public:
++	template<class IO> Result toggle(IO& io, bool simulate, int64_t now) {
++		if (simulate || closing) return {nullptr, -1};
++		if (now >= 0 && lastTap >= 0 && now - lastTap < DebounceMs) return {nullptr, -1};
++		lastTap = now;
++		if (staged) {
++			const Result result = release(io);
++			if (result.error) lastTap = -1;
++			return result;
++		}
++		if (blocked) return {"torch enable blocked until recovery restarts", -1};
++		if (!io.isJudy() || configuration(io) != Match::Expected || gate(io, Gate) != 0)
++			return {"unexpected LED identity, owner or idle state", -1};
++		if (const char* error = io.onGuard()) return {error, -1};
++		for (Node n : {Torch0, Torch1}) {
++			// Both writes are required: a 100 cache alone does not arm the LED.
++			const Write result = io.write(n, TorchCurrent);
++			if (result != Write::NotIssued) staged |= bit(n);
++			if (result != Write::Complete || configuration(io) != Match::Expected || gate(io, Gate) != 0)
++				return enableFailed(io, "could not stage both torches");
++		}
++		if (const char* error = io.onGuard()) return enableFailed(io, error);
++		if (configuration(io) != Match::Expected || gate(io, Gate) != 0)
++			return enableFailed(io, "LED state changed during staging");
++		const Write result = io.write(Gate, 1);
++		gateRequested = result != Write::NotIssued;
++		if (result == Write::Complete && configuration(io) == Match::Expected && gate(io, Gate) == 1)
++			return {nullptr, 1};
++		return enableFailed(io, "could not confirm torch enable");
++	}
++	template<class IO> Result shutdown(IO& io) {
++		closing = true; // no later GUI action can re-enable during reboot
++		return staged ? release(io) : Result{nullptr, -1};
++	}
++
++private:
++	template<class IO> Result enableFailed(IO& io, const char* error) {
++		lastTap = -1;
++		if (!staged) return {error, -1};
++		// A zero current leaves led_on set if the gate never enabled. Do not
++		// risk using leftover armed flags with another ON in this session.
++		blocked = true;
++		const Result result = release(io);
++		return {result.error ? result.error : error, result.icon};
++	}
++};
++
++// Defined once in the recovery executable; libguitwrp uses the same owner.
++Result toggle(bool simulate);
++Result shutdown();
++} // namespace judy_torch
+diff --git a/tests/ext4_maintenance_test.cpp b/tests/ext4_maintenance_test.cpp
+new file mode 100644
+index 0000000..f2d136f
+--- /dev/null
++++ b/tests/ext4_maintenance_test.cpp
+@@ -0,0 +1,189 @@
++// Host test: compile C++14 with external/avb include root and link libavb.
++// Optional argv: private read-only vbmeta fixtures; never embed or publish these.
++#include "../ext4_maintenance.hpp"
++
++#include <cassert>
++#include <fstream>
++#include <iterator>
++#include <iostream>
++
++using namespace ext4_maintenance;
++
++int main(int argc, char** argv) {
++	const uint64_t writable_bytes = 28672, device_bytes = 32768;
++	assert(DescriptorMatches("vendor", 0, "_a", "vendor_a"));
++	assert(!DescriptorMatches("vendor", 0, "_b", "vendor_a"));
++	assert(DescriptorMatches("vendor_a", 1, "_b", "vendor_a"));
++	assert(!DescriptorMatches("vendor", 1, "_a", "vendor_a"));
++	assert(!DescriptorMatches("../vendor", 0, "_a", "vendor_a"));
++	assert(!Interval(UINT64_MAX, 1, UINT64_MAX));
++	assert(!Interval(100, UINT64_MAX, 200));
++	std::vector<uint8_t> unsigned_image(sizeof(AvbVBMetaImageHeader), 0);
++	auto* header = reinterpret_cast<AvbVBMetaImageHeader*>(unsigned_image.data());
++	memcpy(header->magic, AVB_MAGIC, AVB_MAGIC_LEN);
++	header->required_libavb_version_major = avb_htobe32(AVB_VERSION_MAJOR);
++	AvbBounds bounds{"vendor_a", "_a", "", 1048576000, 1048576000};
++	assert(ReadAvbBounds(unsigned_image, &bounds));
++	assert(bounds.ceiling == bounds.physical && !bounds.matched);
++	header->descriptors_size = avb_htobe64(8);
++	assert(!ReadAvbBounds(unsigned_image, &bounds));
++	header->descriptors_size = 0;
++	header->magic[0] = 'X';
++	assert(!ReadAvbBounds(unsigned_image, &bounds));
++
++	// All three physical targets, both selected slots: unsigned layout evidence,
++	// matching descriptor, physical overrun, tree overlap, and unresolved chain.
++	for (const std::string base : {"system", "vendor", "OP"}) {
++		for (const std::string suffix : {"_a", "_b"}) {
++			const size_t descriptor_size = (sizeof(AvbHashtreeDescriptor) + base.size() + 7) & ~size_t(7);
++			const size_t aux_size = (descriptor_size + 63) & ~size_t(63);
++			std::vector<uint8_t> image(sizeof(AvbVBMetaImageHeader) + aux_size, 0);
++			auto* h = reinterpret_cast<AvbVBMetaImageHeader*>(image.data());
++			memcpy(h->magic, AVB_MAGIC, AVB_MAGIC_LEN);
++			h->required_libavb_version_major = avb_htobe32(AVB_VERSION_MAJOR);
++			h->auxiliary_data_block_size = avb_htobe64(aux_size);
++			h->descriptors_size = avb_htobe64(descriptor_size);
++			auto* d = reinterpret_cast<AvbHashtreeDescriptor*>(image.data() + sizeof(*h));
++			d->parent_descriptor.tag = avb_htobe64(AVB_DESCRIPTOR_TAG_HASHTREE);
++			d->parent_descriptor.num_bytes_following = avb_htobe64(descriptor_size - sizeof(AvbDescriptor));
++			d->partition_name_len = avb_htobe32(base.size());
++			memcpy(reinterpret_cast<uint8_t*>(d) + sizeof(*d), base.data(), base.size());
++			d->image_size = avb_htobe64(65536);
++			d->tree_offset = avb_htobe64(65536);
++			d->tree_size = avb_htobe64(4096);
++			AvbBounds b{base + suffix, suffix, "", 131072, 131072};
++			assert(ReadAvbBounds(image, &b) && b.matched && b.ceiling == 65536);
++			b = {base + suffix, suffix, "", 32768, 32768};
++			assert(!ReadAvbBounds(image, &b));
++			b = {base + suffix, suffix, "", 131072, 131072};
++			d->tree_offset = avb_htobe64(32768);
++			assert(!ReadAvbBounds(image, &b));
++			d->parent_descriptor.tag = avb_htobe64(AVB_DESCRIPTOR_TAG_CHAIN_PARTITION);
++			assert(!ReadAvbBounds(image, &b));
++			std::cout << "Synthetic selected target: " << base + suffix << " passed" << std::endl;
++		}
++	}
++
++	unsigned char sb[1024] = {};
++	assert(!Fits(ReadGeometry(sb), writable_bytes));
++	sb[0x38] = 0x53;
++	sb[0x39] = 0xef;
++	sb[0x18] = 2;  // 4096-byte blocks.
++	sb[0x21] = 128;  // 32768 blocks/group.
++	sb[0x29] = 32;  // 8192 inodes/group.
++	sb[0x59] = 1;  // 256-byte inodes.
++	sb[4] = 5;
++	auto fs = ReadGeometry(sb);
++	assert(fs.blocks == 5 && fs.block_bytes == 4096);
++	assert(Growth(fs, writable_bytes) == 7);
++	assert(Growth(fs, writable_bytes - 1) == 6);
++	assert(Growth(fs, 5 * 4096) == 0);
++	assert(Growth(fs, 5 * 4096 - 1) == 0);
++	assert(Growth(fs, (32768 + 5) * 4096ULL) == 32768);
++	assert(Growth(fs, (32768 + 1024) * 4096ULL) == 32768 + 1024);
++	fs.blocks = 32768 + 1;
++	assert(Growth(fs, (32768 + 5) * 4096ULL) == 0);
++	assert(GrowthCeiling(fs, (32768 + 5) * 4096ULL) == 32768);
++	fs.blocks = 5;
++	assert(GrowthCeiling(fs, 5 * 4096ULL) == 5);
++	assert(GrowthCeiling(fs, 5 * 4096ULL - 1) == 0);
++	fs.inode_bytes = 0;
++	assert(GrowthCeiling(fs, 5 * 4096ULL) == 0);
++	uint64_t size = 0, used = 0, free = 0;
++	sb[0xc] = 3;
++	sb[8] = 2;
++	assert(ReadUsage(sb, device_bytes, &size, &used, &free));
++	assert(size == 5 * 4096 && used == 2 * 4096 && free == 3 * 4096);
++	sb[0xc] = 6;
++	assert(!ReadUsage(sb, device_bytes, &size, &used, &free));
++	sb[0xc] = 3;
++	sb[8] = 6;
++	assert(!ReadUsage(sb, device_bytes, &size, &used, &free));
++	sb[8] = 0;
++	sb[0xd0] = 1;
++	assert(HasExternalJournal(sb));
++	// Geometry is independent of write admission and remains visible.
++	assert(FilesystemBytes("ext4", sb, device_bytes) == 5 * 4096);
++	assert(!FilesystemBytes("ext4", sb, 5 * 4096 - 1));
++	assert(!FilesystemBytes("unknown", sb, device_bytes));
++	sb[0xd0] = 0;
++	assert(!HasExternalJournal(sb));
++	sb[0x60] = 0x8;
++	assert(HasExternalJournal(sb));
++	sb[0x60] = 0x80;
++	sb[0x150] = 1;
++	assert(ReadGeometry(sb).blocks == (1ULL << 32) + 5);
++	assert(!Fits(ReadGeometry(sb), writable_bytes));
++	const uint64_t large = ((1ULL << 32) + 5) * 4096;
++	assert(FilesystemBytes("ext4", sb, large) == large);
++	sb[0x158] = 1;  // High free block count, not the reserved counter at 0x154.
++	sb[0x154] = 1;
++	assert(ReadUsage(sb, large, &size, &used, &free));
++	assert(size == large && free == ((1ULL << 32) + 3) * 4096 && used == 2 * 4096);
++	sb[0x158] = 2;
++	assert(!ReadUsage(sb, large, &size, &used, &free));
++	sb[0x158] = 1;
++	sb[0x154] = 2;
++	assert(!ReadUsage(sb, large, &size, &used, &free));
++	sb[0x154] = 1;
++	assert(!ReadUsage(sb, large - 1, &size, &used, &free));
++	unsigned char overflow[1024];
++	memcpy(overflow, sb, sizeof(overflow));
++	memset(overflow + 0x150, 0xff, 4);
++	assert(!ReadUsage(overflow, UINT64_MAX, &size, &used, &free));
++	assert(!Mount_Write_Block("ext4", sb));
++	sb[0x65] = 0x40;  // EXT4_FEATURE_RO_COMPAT_SHARED_BLOCKS.
++	assert(Mount_Write_Block("ext4", sb));
++	assert(FilesystemBytes("ext4", sb, large) == large);
++
++	unsigned char erofs[1024] = {0xe2, 0xe1, 0xf5, 0xe0};
++	erofs[12] = 12;
++	erofs[36] = 5;
++	assert(FilesystemBytes("erofs", erofs, device_bytes) == 5 * 4096);
++	assert(!FilesystemBytes("ext4", erofs, device_bytes));
++	assert(!FilesystemBytes("erofs", erofs, 5 * 4096 - 1));
++	assert(Mount_Write_Block("erofs", erofs));
++	erofs[80] = 0x80;
++	assert(!FilesystemBytes("erofs", erofs, device_bytes));
++	erofs[80] = 0;
++	erofs[12] = 255;
++	assert(!FilesystemBytes("erofs", erofs, device_bytes));
++
++	std::istringstream offline("2 1 0:1 / / rw - rootfs rootfs rw\n");
++	std::istringstream bind("9 2 8:64 /subdir /some/alias ro - ext4 /dev/old-link ro\n");
++	std::istringstream empty;
++	std::istringstream broken("1 2\n");
++	assert(Offline(offline, "8:64"));
++	assert(!Offline(bind, "8:64"));
++	assert(!Offline(empty, "8:64"));
++	assert(!Offline(broken, "8:64"));
++
++	assert(ToolSucceeded(0, true));
++	assert(ToolSucceeded(1 << 8, true));
++	for (int code : {2, 3, 4, 8, 16, 32, 128, 125, 127})
++		assert(!ToolSucceeded(code << 8, true));
++	assert(!ToolSucceeded(SIGKILL, true));
++	assert(!ToolSucceeded(-1, true));
++	assert(ToolSucceeded(0, false));
++	assert(!ToolSucceeded(1 << 8, false));
++	for (int i = 1; i < argc; ++i) {
++		std::ifstream file(argv[i], std::ios::binary);
++		std::vector<uint8_t> image((std::istreambuf_iterator<char>(file)), {});
++		AvbBounds vendor{"vendor_a", "_a", "", 1048576000, 1048576000};
++		assert(ReadAvbBounds(image, &vendor));
++		assert(vendor.matched && vendor.ceiling == 1031950336);
++		std::cout << "Fixture vendor runtime ceiling: " << vendor.ceiling << std::endl;
++		for (const std::string suffix : {"_a", "_b"}) {
++			for (const std::string base : {"system", "vendor", "OP"}) {
++				const uint64_t physical = base == "system" ? 4756340736ULL :
++				                          (base == "vendor" ? 1048576000ULL : 660602880ULL);
++				AvbBounds actual{base + suffix, suffix, "", physical, physical};
++				assert(ReadAvbBounds(image, &actual));
++				std::cout << "Fixture " << base + suffix << " physical=" << physical
++				          << " ceiling=" << actual.ceiling << " matched=" << actual.matched << std::endl;
++			}
++		}
++		image[300] ^= 1;
++		assert(!ReadAvbBounds(image, &vendor));
++	}
++}
+diff --git a/tests/judy_torch_test.cpp b/tests/judy_torch_test.cpp
+new file mode 100644
+index 0000000..c5892ab
+--- /dev/null
++++ b/tests/judy_torch_test.cpp
+@@ -0,0 +1,284 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Standalone host test; no Android headers or device/sysfs I/O.
++#include "../judy_torch.hpp"
++
++#include <cstdio>
++#include <cstdlib>
++#include <functional>
++#include <initializer_list>
++#include <map>
++#include <vector>
++
++using namespace judy_torch;
++#define CHECK(c) do { if (!(c)) { std::fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); std::exit(1); } } while (0)
++using Command = std::pair<Node, int>;
++const Command stage0{Torch0, 100}, stage1{Torch1, 100}, on{Gate, 1}, off{Gate, 0}, clear0{Torch0, 0}, clear1{Torch1, 0};
++
++struct Fake {
++	Controller state;
++	bool judy = true, enabled = false, armed[2] = {};
++	bool gateOnIgnored = false;
++	int reads = 0, guards = 0, brightness[6] = {100, 0, 100, 850, 850, 0};
++	int maximum[6] = {100, 255, 100, 850, 850, 255};
++	std::string triggers[6] = {"torch0_trigger", "switch0_trigger", "torch1_trigger", "flash0_trigger", "flash1_trigger", "none"};
++	std::map<std::string, std::string> paths;
++	std::vector<Command> writes;
++	std::map<Command, int> notIssued, uncertain, failAfterWrite;
++	std::function<void(Command)> afterWrite;
++	int badRead[6] = {}, refuseGuard = 0;
++
++	Fake() {
++		for (Node n : {Torch0, Torch1, Gate, Flash0, Flash1, AuxGate}) {
++			const std::string path = std::string("/sys/class/leds/") + led(n).name;
++			paths[path] = canonical(n);
++			paths[path + "/device/driver"] = "/sys/bus/platform/drivers/qcom,qpnp-flash-led-v2";
++		}
++	}
++	bool isJudy() { ++reads; return judy; }
++	const char* onGuard() { return ++guards == refuseGuard ? "guard refused" : nullptr; }
++	std::string resolve(const std::string& p) { ++reads; return paths.at(p); }
++	std::string trigger(Node n) { ++reads; return triggers[n]; }
++	int number(Node n, const std::string& attr) {
++		++reads;
++		if (attr == "max_brightness") return maximum[n];
++		CHECK(attr == "brightness");
++		if (badRead[n] > 0) { --badRead[n]; return -1; }
++		return brightness[n];
++	}
++	Write write(Node n, int v) {
++		Command cmd{n, v};
++		CHECK(cmd == stage0 || cmd == stage1 || cmd == on || cmd == off || cmd == clear0 || cmd == clear1);
++		CHECK(n == Gate || (brightness[Gate] == 0 && brightness[AuxGate] == 0));
++		writes.push_back(cmd);
++		if (notIssued[cmd] > 0) { --notIssued[cmd]; return Write::NotIssued; }
++		if (uncertain[cmd] > 0) { --uncertain[cmd]; return Write::Uncertain; }
++		brightness[n] = v;
++		if (cmd == stage0 || cmd == stage1) armed[n == Torch1] = true;
++		if (cmd == clear0 || cmd == clear1) triggers[n] = "none"; // does NOT disarm
++		if (cmd == on) {
++			CHECK(armed[0] && armed[1]);
++			enabled = !gateOnIgnored;
++		}
++		if (cmd == off && enabled) enabled = armed[0] = armed[1] = false;
++		if (afterWrite) afterWrite(cmd);
++		if (failAfterWrite[cmd] > 0) { --failAfterWrite[cmd]; return Write::Uncertain; }
++		return Write::Complete;
++	}
++	Result tap(int64_t t = 1000, bool simulate = false) { return state.toggle(*this, simulate, t); }
++	Result reboot() { return state.shutdown(*this); }
++	void expect(std::initializer_list<Command> commands) {
++		CHECK(writes == std::vector<Command>(commands));
++		writes.clear();
++	}
++	void expectBlocked(int64_t t = 5000) {
++		const Result r = tap(t);
++		CHECK(r.error && r.icon == -1);
++		expect({});
++	}
++};
++
++static void normal() {
++	Fake idle;
++	CHECK(idle.reads == 0 && idle.tap(0, true).icon == -1);
++	CHECK(!idle.reboot().error && idle.reads == 0 && idle.guards == 0);
++	CHECK(idle.tap().icon == -1 && idle.reads == 0);
++	idle.expect({});
++
++	Fake f;
++	for (int t : {1000, 2000}) {
++		CHECK(!f.armed[0] && !f.armed[1]);
++		const Result r = f.tap(t);
++		CHECK(!r.error && r.icon == 1 && f.enabled);
++		f.expect({stage0, stage1, on});
++		int before = f.reads;
++		CHECK(f.tap(t + 1).icon == -1 && f.tap(t + 400, true).icon == -1 && f.reads == before);
++		CHECK(f.tap(t + 500).icon == 0 && !f.enabled && !f.armed[0] && !f.armed[1]);
++		f.expect({off, clear0, clear1});
++		CHECK(f.triggers[Torch0] == "none" && f.triggers[Torch1] == "none" && f.triggers[Gate] == "switch0_trigger");
++	}
++	int before = f.reads;
++	CHECK(!f.reboot().error && f.reads == before && f.guards == 4);
++	f.expect({});
++
++	Fake reboot;
++	CHECK(reboot.tap().icon == 1 && reboot.reboot().icon == 0);
++	CHECK(reboot.tap(5000).icon == -1 && !reboot.reboot().error);
++	reboot.expect({stage0, stage1, on, off, clear0, clear1});
++}
++
++static void preflight() {
++	Fake board;
++	board.judy = false;
++	CHECK(board.tap().error && board.reads == 1);
++	board.expect({});
++	for (Node n : {Torch0, Torch1, Gate, Flash0, Flash1, AuxGate}) {
++		for (int problem = 0; problem < 7; ++problem) {
++			Fake f;
++			const std::string p = std::string("/sys/class/leds/") + led(n).name;
++			switch (problem) {
++			case 0: f.paths[p] = ""; break;
++			case 1: f.paths[p] = canonical(n) + "_1"; break;
++			case 2: f.paths[p] = "/other/" + canonical(n); break;
++			case 3: f.paths[p + "/device/driver"] += "-other"; break;
++			case 4: f.maximum[n]--; break;
++			case 5: f.triggers[n] = n == AuxGate ? "switch2_trigger" : "none"; break;
++			case 6: f.brightness[n] = n == Flash0 || n == Flash1 ? 0 : 1; break;
++			}
++			CHECK(f.tap().error);
++			f.expect({});
++			int before = f.reads;
++			CHECK(!f.reboot().error && f.reads == before);
++		}
++	}
++	Fake guard;
++	guard.refuseGuard = 1;
++	CHECK(guard.tap().error);
++	guard.expect({});
++	CHECK(guard.tap(2000).icon == 1); // declined before any staging
++	guard.refuseGuard = guard.guards + 1;
++	CHECK(guard.tap(3000).icon == 0 && guard.guards == 3); // OFF never runs the ON guard
++	guard.expect({stage0, stage1, on, off, clear0, clear1});
++
++	CHECK(selected("none heartbeat [torch0_trigger] timer \n") == "torch0_trigger");
++	CHECK(selected("[none] timer torch0_trigger \n") == "none");
++	for (const char* bad : {"", "none torch0_trigger", "[none] [torch0_trigger]", "x[torch0_trigger]", "[torch0_trigger]x"})
++		CHECK(selected(bad).empty());
++}
++
++static void stagingFailures() {
++	Fake unopened;
++	unopened.notIssued[stage0] = 1;
++	CHECK(unopened.tap().error);
++	unopened.expect({stage0});
++	CHECK(unopened.tap(1001).icon == 1); // nothing may have been staged
++	unopened.expect({stage0, stage1, on});
++
++	Fake secondUnopened;
++	secondUnopened.notIssued[stage1] = 1;
++	CHECK(secondUnopened.tap().error);
++	secondUnopened.expect({stage0, stage1, clear0});
++	CHECK(secondUnopened.armed[0] && !secondUnopened.armed[1]);
++	CHECK(secondUnopened.brightness[Torch1] == 100 && secondUnopened.triggers[Torch1] == "torch1_trigger");
++	secondUnopened.expectBlocked();
++
++	for (Command failed : {stage0, stage1}) {
++		for (int failure = 0; failure < 3; ++failure) {
++			Fake f;
++			if (failure == 0) f.uncertain[failed] = 1;
++			if (failure == 1) f.failAfterWrite[failed] = 1;
++			if (failure == 2) f.afterWrite = [&](Command cmd) { if (cmd == failed) f.badRead[cmd.first] = 1; };
++			CHECK(f.tap().error && !f.enabled);
++			if (failed == stage0) f.expect({stage0, clear0});
++			else f.expect({stage0, stage1, clear0, clear1});
++			f.expectBlocked();
++		}
++	}
++	Fake wrongStage;
++	wrongStage.afterWrite = [&](Command c) { if (c == stage1) wrongStage.brightness[Torch1] = 47; };
++	CHECK(wrongStage.tap().error && !wrongStage.enabled);
++	wrongStage.expect({stage0, stage1, clear0}); // don't clear a foreign current
++	wrongStage.brightness[Torch1] = 100;
++	CHECK(wrongStage.tap(1001).icon == 0);
++	wrongStage.expect({clear1});
++	wrongStage.expectBlocked();
++
++	Fake lateGuard;
++	lateGuard.refuseGuard = 2;
++	CHECK(lateGuard.tap().error);
++	lateGuard.expect({stage0, stage1, clear0, clear1});
++	lateGuard.expectBlocked();
++}
++
++static void gateFailures() {
++	for (int failure = 0; failure < 5; ++failure) {
++		Fake f;
++		if (failure == 0) f.notIssued[on] = 1;
++		if (failure == 1) f.uncertain[on] = 1;
++		if (failure == 2) f.failAfterWrite[on] = 1;
++		if (failure == 3) f.afterWrite = [&](Command c) { if (c == on) f.badRead[Gate] = 1; };
++		if (failure == 4) {
++			f.gateOnIgnored = true;
++			f.afterWrite = [&](Command c) { if (c == on) f.brightness[Gate] = 0; };
++		}
++		CHECK(f.tap().error && !f.enabled);
++		if (failure == 0) f.expect({stage0, stage1, on, clear0, clear1});
++		else f.expect({stage0, stage1, on, off, clear0, clear1});
++		CHECK(f.armed[0] == (failure == 0 || failure == 1 || failure == 4));
++		f.expectBlocked();
++	}
++	// The LED class provides no way to distinguish this hardware failure
++	// from successful sysfs writes; the icon reflects only the request/cache.
++	Fake cacheOnly;
++	cacheOnly.gateOnIgnored = true;
++	CHECK(cacheOnly.tap().icon == 1 && !cacheOnly.enabled);
++	CHECK(cacheOnly.tap(2000).icon == 0 && cacheOnly.armed[0] && cacheOnly.armed[1]);
++	cacheOnly.expect({stage0, stage1, on, off, clear0, clear1});
++
++	Fake failedOff;
++	CHECK(failedOff.tap().icon == 1);
++	failedOff.notIssued[off] = 3;
++	Result r = failedOff.tap(2000);
++	CHECK(r.error && r.icon == -1 && failedOff.brightness[Gate] == 1);
++	failedOff.expect({stage0, stage1, on, off, off, off});
++	CHECK(failedOff.tap(2001).icon == 0); // failed OFF bypasses debounce
++	failedOff.expect({off, clear0, clear1});
++	CHECK(failedOff.tap(3000).icon == 1);
++	failedOff.expect({stage0, stage1, on});
++
++	Fake badOffRead;
++	CHECK(badOffRead.tap().icon == 1);
++	int once = 1;
++	badOffRead.afterWrite = [&](Command c) { if (c == off && once-- > 0) badOffRead.badRead[Gate] = 1; };
++	CHECK(badOffRead.reboot().icon == 0);
++	badOffRead.expect({stage0, stage1, on, off, off, clear0, clear1});
++
++	Fake failedClear;
++	CHECK(failedClear.tap().icon == 1);
++	failedClear.notIssued[clear0] = 3;
++	r = failedClear.tap(2000);
++	CHECK(r.error && r.icon == -1 && failedClear.brightness[Gate] == 0);
++	failedClear.expect({stage0, stage1, on, off, clear0, clear1, clear0, clear0});
++	CHECK(failedClear.reboot().icon == 0);
++	failedClear.expect({clear0});
++}
++
++static void external() {
++	Fake race;
++	race.afterWrite = [&](Command c) { if (c == stage0) race.brightness[Gate] = 1; };
++	CHECK(race.tap().error);
++	race.expect({stage0}); // did not touch the newly occupied gate or stage the second torch
++	CHECK(race.tap(1001).error);
++	race.expect({});
++	race.brightness[Gate] = 0;
++	CHECK(race.tap(1002).icon == 0);
++	race.expect({clear0});
++	race.expectBlocked();
++
++	Fake trigger;
++	CHECK(trigger.tap().icon == 1);
++	trigger.triggers[Gate] = "none";
++	CHECK(trigger.tap(2000).error);
++	trigger.triggers[Gate] = led(Gate).trigger;
++	CHECK(trigger.tap(2001).error); // restored trigger is not new ownership
++	trigger.expect({stage0, stage1, on});
++
++	for (Node n : {Gate, Torch0, Torch1, Flash0, Flash1, AuxGate}) {
++		Fake changed;
++		CHECK(changed.tap().icon == 1);
++		const int original = changed.brightness[n];
++		changed.brightness[n] = 24; // configuration no longer ours
++		CHECK(changed.tap(2000).error);
++		changed.brightness[n] = original;
++		CHECK(changed.tap(2001).error); // don't reclaim the running gate
++		changed.expect({stage0, stage1, on});
++		changed.brightness[Gate] = 0;
++		CHECK(changed.tap(2002).icon == 0);
++		changed.expect({clear0, clear1});
++		changed.expectBlocked();
++	}
++}
++
++int main() {
++	normal(); preflight(); stagingFailures(); gateFailures(); external();
++	std::puts("Judy dual torch host tests passed (fake LED class only)");
++}
+diff --git a/orangefox.mk b/orangefox.mk
+index ec6cf5a..2b30956 100644
+--- a/orangefox.mk
++++ b/orangefox.mk
+@@ -120,6 +120,10 @@ else
+     LOCAL_CFLAGS += -DOF_MAINTAINER='"Testing build (unofficial)"'
+ endif
+ 
++ifeq ($(TARGET_DEVICE),judyln)
++    LOCAL_CFLAGS += -DOF_JUDYLN_QPNP_TORCH
++endif
++
+ ifneq ($(OF_FLASHLIGHT_ENABLE),)
+     LOCAL_CFLAGS += -DOF_FLASHLIGHT_ENABLE='"$(OF_FLASHLIGHT_ENABLE)"'
+ else
